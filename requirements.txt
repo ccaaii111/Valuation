@@ -1,0 +1,7 @@
+# 运行时依赖（实测于 Python 3.13.5 / anaconda base）。装新版前先看这一行：
+# pandas 3.x 与 akshare 的取数返回结构有耦合，升级请跑 python tests/run_all.py。
+akshare==1.18.96        # 10Y 国债收益率（bond_zh_us_rate），免登录
+pandas==3.0.5           # akshare 的依赖，也被取数层直接使用
+httpx==0.28.1           # 东财 F10 / 行情取数的 HTTP 客户端
+flask==3.1.3            # scripts/serve_panel.py 的本地面板服务
+pypinyin==0.55.0        # 股票索引的简拼/全拼检索（backend/data/universe.py）
