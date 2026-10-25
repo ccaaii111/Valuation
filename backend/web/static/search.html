@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>搜索股票 · DCF</title>
+<link rel="stylesheet" href="/assets/app.css">
+<style>
+  .searchbar { display:flex; gap:10px; align-items:center; margin:6px 0 4px; }
+  #q { flex:1 1 320px; font-size:16px; padding:7px 10px; }
+  #hits td { background:#fff; }
+  #hits tr { cursor:pointer; }
+  #hits tr.on td { background:#e6f0ff; box-shadow:0 0 0 1px var(--accent) inset; }
+  #hits tr.off td { color:var(--muted); background:#f1f2f4; }
+  #hits tr.off .why { color:#8a8f98; }
+  td.op { text-align:left; }
+  .why { font-size:12px; color:var(--muted); }
+  .hit-code { font-variant-numeric:tabular-nums; }
+  .go { font-size:12px; padding:1px 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>搜索股票</h1>
+  <a class="navlink" href="/">首页</a>
+  <span id="meta" class="muted"></span>
+</header>
+<main>
+  <div class="searchbar">
+    <input id="q" placeholder="代码 / 名称 / 简拼 — 例如 600519、茅台、gzmt、guizhoumaotai" autocomplete="off" spellcheck="false">
+    <span class="muted">↑↓ 选 · Enter 估值 · Esc 清空</span>
+  </div>
+  <div id="notices"></div>
+  <!-- 表要留在页面滚动流里：包一层 .scroll（overflow-x:auto）会让浏览器把 overflow-y 也算成 auto，
+       容器自己成了滚动参照系却永远不滚，th 的 sticky 就此失效——列名跟着行一起滚走。 -->
+  <table id="hits"></table>
+</main>
+<script src="/assets/common.js"></script>
+<script>
+// 索引整份拿在手里，每次按键在浏览器里过一遍——5000+ 行、O(n) 一次几毫秒，回服务端反而慢。
+const LIMIT = 50;
+const entries = [];
+let hits = [];
+let cursor = 0;
+let composing = false;
+let fetched = {};  // runs/ 里已有的批次，按代码索引
+
+// 匹配优先级：完全等于 > 前缀 > 包含。数字走代码，字母走简拼/全拼，汉字走名称。
+function rank(query) {
+  const digits = query.replace(/\D/g, "");
+  const alpha = query.replace(/[^0-9a-z]/gi, "").toLowerCase();
+  const cjk = /[\u4e00-\u9fff]/.test(query);
+  const out = [];
+  for (const e of entries) {
+    let score = -1;
+    if (digits && e.code === digits) score = 0;
+    else if (cjk && e.name === query) score = 1;
+    else if (digits && e.code.startsWith(digits)) score = 2;
+    else if (alpha && e.py && e.py.startsWith(alpha)) score = 3;
+    else if (cjk && e.name.includes(query)) score = 4;
+    else if (alpha && e.full && e.full.startsWith(alpha)) score = 5;
+    else if (alpha && e.py && e.py.includes(alpha)) score = 6;
+    else if (alpha && e.full && e.full.includes(alpha)) score = 7;
+    if (score >= 0) out.push([score, e]);
+  }
+  out.sort((a, b) => a[0] - b[0] || (a[1].code < b[1].code ? -1 : 1));
+  return out.map(([, e]) => e);
+}
+
+function search() {
+  const query = $("q").value.trim();
+  if (composing) { render(); return; }  // 输入法还没上屏，别用半截拼音去匹配
+  hits = query ? rank(query) : [];
+  cursor = 0;
+  render();
+}
+
+function render() {
+  const query = $("q").value.trim();
+  const shown = hits.slice(0, LIMIT);
+  const more = hits.length - shown.length;
+  $("hits").innerHTML = (query ? `<tr><th>代码</th><th>名称</th><th>板块</th><th>已有基线</th><th></th></tr>` : "")
+    + shown.map((e, i) => {
+      const runs = fetched[e.code];
+      return `<tr data-code="${e.code}" class="${i === cursor ? "on" : ""}${e.blocked ? " off" : ""}">`
+        + `<td class="op hit-code">${esc(e.code)}</td>`
+        + `<td class="op">${esc(e.name)}${e.blocked ? ` <span class="badge">${esc(e.blocked)}</span>` : ""}</td>`
+        + `<td class="op">${esc(e.board)}</td>`
+        + `<td class="op">${runs ? `<a class="navlink" href="/panel?code=${e.code}&amp;run=${runs[0].run_id}">${runs.length} 个批次 · 最近 ${esc(runs[0].run_id)}</a>` : '<span class="why">未取数</span>'}</td>`
+        + `<td class="op"><button class="go" ${e.blocked ? "disabled" : ""}>取数估值</button></td></tr>`;
+    }).join("");
+  if (!query) {
+    $("hits").innerHTML = `<tr><td class="op muted">开始输入即搜索：代码前缀、名称包含、简拼或全拼都能命中。</td></tr>`
+      + `<tr><td class="op muted">六位代码在清单里搜不到时会写明「可能已退市」并给出去处——名录在联网之前就把取数拦下（查无此票，退出码 3），不会静默出基线。</td></tr>`;
+    return;
+  }
+  if (!hits.length) {
+    const digits = query.replace(/\D/g, "");
+    $("hits").innerHTML = `<tr><td class="op">清单里没有「${esc(query)}」。</td></tr>`
+      + (digits.length === 6
+        ? `<tr><td class="op">6 位代码 <b>${esc(digits)}</b> 格式没错，但当前 A 股名录里没有：多半是<b>可能已退市</b>，也可能从没上市。`
+          + `仍然想试一次就跑 <code>python scripts/build_baseline.py ${esc(digits)}</code>——它会在发起任何请求之前照实报「查无此票」，不会白跑一遍行情。`
+          + `若这只票其实刚上市（名录七天刷新一次，新上市的会晚到），先跑 <code>python scripts/update_universe.py --force</code> 重建名录。</td></tr>`
+        : `<tr><td class="op">换个写法：三位简拼（gzmt）、名称里的两个字（茅台）、或六位代码。索引 ${esc(String($("meta").dataset.total || ""))} 只。</td></tr>`);
+    return;
+  }
+  $("hits").insertAdjacentHTML("beforeend",
+    more > 0 ? `<tr><td class="op muted" colspan="5">还有 ${more} 条，继续输入以缩小范围</td></tr>` : "");
+  $("hits").querySelectorAll("tr[data-code]").forEach((tr) => {
+    tr.addEventListener("mouseenter", () => { cursor = hits.findIndex((e) => e.code === tr.dataset.code); paintCursor(); });
+    tr.addEventListener("click", () => go(tr.dataset.code));
+  });
+}
+
+function paintCursor() {
+  $("hits").querySelectorAll("tr[data-code]").forEach((tr, i) => tr.classList.toggle("on", i === cursor));
+}
+
+function move(step) {
+  if (!hits.length) return;
+  cursor = Math.min(Math.max(cursor + step, 0), Math.min(hits.length, LIMIT) - 1);
+  paintCursor();
+  reveal(document.querySelector(`tr[data-code="${hits[cursor].code}"]`));
+}
+
+// scrollIntoView({block:"nearest"}) 把行对齐到视口上沿，而视口上沿是 sticky 标题条的地盘：
+// 键盘往回走时选中行正好被推进标题条底下。所以滚动距离自己算，天花板取标题条的实测底边——
+// 不解析 --header-h（隐藏标签页里那次读到空值，换算成 0 就让行停在 top:4），也不写死数字。
+function reveal(row) {
+  if (!row) return;
+  const header = document.querySelector("header");
+  const ceiling = Math.max(0, header ? header.getBoundingClientRect().bottom : 0);
+  const box = row.getBoundingClientRect();
+  if (box.top < ceiling) window.scrollBy(0, box.top - ceiling - 4);
+  else if (box.bottom > window.innerHeight) window.scrollBy(0, box.bottom - window.innerHeight + 4);
+}
+
+function go(code) {
+  const entry = entries.find((e) => e.code === code);
+  if (entry && entry.blocked) { setNotice(`${code} ${entry.name}：${entry.blocked}`); return; }
+  // 「取数估值」只有一个按钮：新旧与否由后台判断（见 /api/valuation_status），这里只把意图带过去。
+  location.href = "/panel?code=" + encodeURIComponent(code) + "&go=fetch";
+}
+
+function setNotice(text) {
+  $("notices").innerHTML = text ? `<div class="strip warn">${esc(text)}</div>` : "";
+}
+
+async function loadIndex() {
+  const response = await fetch("/api/universe");
+  const data = await response.json();
+  if (!response.ok) {
+    setNotice(data.error + "（面板照常可用：直接知道六位代码的话，在下方输入代码即可跳过索引）");
+    return;
+  }
+  entries.push(...data.entries);
+  $("meta").textContent = `${data.total} 只 · 索引生成于 ${String(data.generated_at).slice(0, 10)}`;
+  $("meta").dataset.total = data.total;
+  if (data.stale) setNotice(`股票索引已 ${Math.floor(data.age_days)} 天未更新（超过 ${data.max_age_days} 天），新上市/新退市的票这阵子搜不到：跑 python scripts/update_universe.py 刷新`);
+}
+
+async function loadFetched() {
+  const options = await (await fetch("/api/options")).json();
+  fetched = Object.fromEntries((options.codes || []).map((c) => [c.code, c.runs]));
+}
+
+function bind() {
+  $("q").addEventListener("input", search);
+  $("q").addEventListener("compositionstart", () => { composing = true; });
+  $("q").addEventListener("compositionend", () => { composing = false; search(); });
+  $("q").addEventListener("keydown", (event) => {
+    if (event.isComposing || composing) return;  // 输入法在选词，方向键归它用
+    if (event.key === "ArrowDown") { event.preventDefault(); move(1); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); move(-1); }
+    else if (event.key === "Enter") { event.preventDefault(); if (hits[cursor]) go(hits[cursor].code); }
+    else if (event.key === "Escape") { $("q").value = ""; search(); }
+  });
+}
+
+boot();
+async function boot() {
+  stickHeader();
+  bind();
+  $("q").focus();
+  await Promise.all([loadIndex(), loadFetched()]);
+  render();
+}
+</script>
+</body>
+</html>
