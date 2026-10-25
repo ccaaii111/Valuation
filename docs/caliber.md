@@ -68,12 +68,13 @@ tests/                    29 个 test_*.py 套件、fixtures.py 的假公司数�
                           dom_derivation_check.js 检查页面脚本（判据见 §10 末）
 docs/caliber.md           本文件
 requirements.txt          五个直接依赖包及版本
-start_panel.bat           Windows 下双击开面板
-.gitignore                排除 runs/、data/universe.json、缓存与日志
+deploy_panel.bat          Windows 下双击：建 .venv、按 requirements.txt 装包、开面板
+start_panel.bat           Windows 下双击开面板，依赖得已经装好
+.gitignore                排除 runs/、data/universe.json、.venv/、缓存与日志
 ```
 
-`data/` 与 `runs/` 都不在版本库里：克隆下来这两个目录并不存在，第一次取数才会把它们建出来。批次落盘的具体格式、
-分源新鲜度阈值和模块之间怎么串，见 §4 与 §5。
+`data/` 与 `runs/` 都不在版本库里：克隆下来这两个目录并不存在，第一次取数才会把它们建出来。`deploy_panel.bat` 建的
+`.venv/` 同理。批次落盘的具体格式、分源新鲜度阈值和模块之间怎么串，见 §4 与 §5。
 
 ---
 
