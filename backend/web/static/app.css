@@ -1,0 +1,65 @@
+:root { --line:#d8dbe0; --muted:#6b7280; --bg:#f6f7f9; --ok:#0a7f3f; --bad:#b3261e; --accent:#1d4ed8; --header-h:49px; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:#15181e; font:14px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif; }
+header { position:sticky; top:0; z-index:5; background:#fff; border-bottom:1px solid var(--line); padding:10px 16px; display:flex; flex-wrap:wrap; gap:10px 14px; align-items:center; }
+h1 { font-size:15px; margin:0 10px 0 0; font-weight:600; }
+select, input, button { font:inherit; padding:3px 7px; border:1px solid var(--line); border-radius:5px; background:#fff; }
+button { cursor:pointer; }
+datalist { display:none; }
+button:hover { border-color:var(--accent); color:var(--accent); }
+label { color:var(--muted); font-size:13px; }
+main { padding:14px 16px 40px; max-width:1500px; }
+.cards { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:12px; }
+.card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:9px 13px; min-width:150px; }
+.card b { display:block; font-size:20px; font-variant-numeric:tabular-nums; }
+.card span { color:var(--muted); font-size:12px; }
+.matrix { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; margin-bottom:14px; }
+.cell { background:#fff; border:1px solid var(--line); border-radius:8px; padding:7px 10px; cursor:pointer; font-variant-numeric:tabular-nums; }
+.cell.on { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+.cell i { font-style:normal; color:var(--muted); font-size:12px; }
+.cell small { float:right; color:var(--muted); }
+table { width:100%; border-collapse:collapse; background:#fff; }
+th, td { border-bottom:1px solid var(--line); padding:5px 8px; text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+th { color:var(--muted); font-weight:600; font-size:12px; text-align:right; position:sticky; top:var(--header-h); background:#eef0f3; z-index:2; }
+th:first-child, td:first-child { text-align:left; }
+td.lbl { text-align:left; max-width:260px; white-space:normal; }
+td.src { text-align:left; color:var(--muted); font-size:12px; white-space:normal; max-width:320px; }
+tr.hidden { display:none; }
+tr.edited td { background:#fff8e6; }
+tr.recomputed td { background:#eef4ff; }
+tr.locked td { color:#4a5058; }
+td.edit.derived { font-weight:600; }
+input.num { width:96px; text-align:right; }
+input.num.pct { width:82px; }
+input.num.delta { width:64px; }
+.abs { color:var(--muted); font-size:12px; margin-left:4px; }
+.badge { display:inline-block; font-size:11px; padding:0 5px; border-radius:9px; background:#e8ebf0; color:#39404a; margin-left:5px; }
+.badge.derived { background:#e6f0ff; color:var(--accent); }
+.badge.convention { background:#f1e8ff; color:#6b3fa0; }
+.pos { color:var(--ok); } .neg { color:var(--bad); } .dim { color:var(--muted); }
+.strip { border:1px solid var(--line); border-left:3px solid var(--accent); background:#fff; border-radius:8px; padding:8px 12px; margin:12px 0; }
+.strip.warn { border-left-color:#c2410c; background:#fff7ed; }
+.strip.alert { border-left-color:var(--bad); background:#fef2f2; }
+.strip-ok { border-left-color:var(--ok); background:#f0fdf4; }
+h2 { font-size:13px; margin:18px 0 6px; color:#39404a; font-weight:600; }
+.scroll { overflow-x:auto; }
+/* overflow-x:auto 会把 overflow-y 也算成 auto：容器成了滚动参照系，但高度跟着内容长，
+   于是永远不滚——里面的 sticky th 失去参照，列名直接随页面滚走。要钉表头就得给它真实可视高度，
+   让容器自己成为竖向滚动区（与 /derivation 的 .graph-scroll 同一手法）。 */
+.scroll.pin { max-height:calc(100vh - var(--header-h) - 28px); }
+/* 容器自己滚动时，参照系是它自己的上沿，标题条已经不在里面了——sticky top 必须归零，否则行会从表头上方的缝里穿过。 */
+.scroll.pin th { top:0; }
+/* 分年路径把表格撑到 2549px（12 年批实测），1920 屏下「当前值」整列必然出屏。不缩版式，改成钉住首列：
+   横滚到哪一行都还认得出自己是谁。两条 sticky 分开看——th 钉上下（上面那条），td 钉左右。
+   border-collapse 下 sticky 格的 border 会跟着内容滚走，所以分隔线用 inset 阴影画在格子里侧。
+   首列必须自带不透明背景（否则右边的格子会从它背后透出来），而行底色在 tr 上，得逐态重抄一遍。 */
+#ladder th:first-child, #ladder td.lbl { position:sticky; left:0; background:#fff; box-shadow:inset -1px 0 0 var(--line); }
+#ladder td.lbl { z-index:1; }
+#ladder tr.edited td.lbl { background:#fff8e6; }
+#ladder tr.recomputed td.lbl { background:#eef4ff; }
+#ladder th:first-child { z-index:3; background:#eef0f3; }   /* 左上角既钉顶又钉左，压过 th 与首列 */
+.muted { color:var(--muted); font-size:12px; }
+.years { display:flex; gap:4px; justify-content:flex-end; flex-wrap:wrap; }
+.years span { font-size:11px; color:var(--muted); }
+.navlink { color:var(--accent); text-decoration:none; font-size:13px; }
+.navlink:hover { text-decoration:underline; }
