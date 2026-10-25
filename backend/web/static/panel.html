@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>假设修正面板 · DCF</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<header>
+  <h1>假设修正面板</h1>
+  <a class="navlink" href="/">首页</a>
+  <a class="navlink" id="derivation-link" href="#" title="同一批假设的推导链视图：改数写同一份 manual.json">推导图</a>
+  <label>代码 <input id="code" size="9" list="codes" placeholder="600519" autocomplete="off" spellcheck="false"></label>
+  <datalist id="codes"></datalist>
+  <label>贝塔 <input id="fetchbeta" size="5" placeholder="回归" title="留空＝用 156 周周频行情对右侧「市场基准」回归，测到多少用多少。β 实测为负时折不出可用的股权成本，此时填一个正数（等同 CLI 的 --beta）。名录里没有的代码（已退市／从没上市／代码写错）填 β 也救不回来——它在发起任何请求之前就被拒；只有行情源抖动那种「没取到」值得稍后重取一次。"></label>
+  <label>市场基准 <select id="benchmark"></select></label>
+  <label>ERP 窗口 <select id="erpwindow"></select></label>
+  <button id="fetch" title="联网取数并生成机器基线（约数十秒）；数据仍在有效期内时后台只会复现快照，不联网；A 股名录里没有的代码直接拒，一次网都不上">取数估值</button>
+  <button id="refetch" hidden title="跳过新鲜度判断，联网重取一份新凭证">强制重取</button>
+  <span id="freshness" class="muted"></span>
+  <label>取数批次 <select id="run"></select></label>
+  <label>口径 <select id="method"><option value="fcff">FCFF</option><option value="fcfe">FCFE</option></select></label>
+  <label>终值 <select id="terminal"><option value="gordon">Gordon</option><option value="exit_multiple">退出倍数</option><option value="uem">UEM</option></select></label>
+  <label>折现率 <input id="rate" size="5" placeholder="级联"></label>
+  <label>年中 <select id="midyear"><option value="">默认</option><option value="1">是</option><option value="0">否</option></select></label>
+  <button id="reload" title="只重新加载本页面，不会重新联网取数">刷新页面</button>
+  <button id="reset">清空修正</button>
+  <button id="save">保存修正</button>
+  <label><input type="checkbox" id="showall" checked> 显示未改动行</label>
+  <span id="status" class="muted"></span>
+</header>
+<main>
+  <div class="cards" id="summary"></div>
+  <div class="matrix" id="matrix"></div>
+  <div id="notices"></div>
+  <div class="scroll pin"><table id="ladder"></table></div>
+  <h2>折现明细</h2>
+  <div class="scroll"><table id="schedule"></table></div>
+  <h2>警示与自洽性</h2>
+  <div id="warnings"></div>
+</main>
+<script src="/assets/common.js"></script>
+<script>
+const state = { code: "", run: "", overrides: {}, seq: 0, rows: {}, data: null };
+
+function collectOverrides() {
+  const next = {};
+  for (const [key, cell] of Object.entries(state.rows)) {
+    const row = cell.row;
+    if (!row.editable || row.derived) continue;
+    if (row.value_type === "year_map") {
+      const edits = {};
+      for (const [year, input] of Object.entries(cell.yearInputs)) {
+        const raw = input.value.trim();
+        if (raw === "") continue;
+        const mode = cell.yearModes[year];
+        const value = toAbsolute(row, row.baseline[year], raw, mode);
+        if (value === null) return null;
+        if (isChanged(raw, value, row.baseline[year], mode)) edits[year] = value;
+      }
+      if (Object.keys(edits).length) next[key] = edits;
+    } else if (row.value_type === "bool") {
+      if (cell.input.checked !== row.baseline) next[key] = cell.input.checked;
+    } else if (row.value_type === "number") {
+      const raw = cell.input.value.trim();
+      if (raw === "") continue;
+      const value = toAbsolute(row, row.baseline, raw, cell.mode);
+      if (value === null) return null;
+      if (isChanged(raw, value, row.baseline, cell.mode)) next[key] = value;
+    }
+  }
+  return next;
+}
+
+function buildTable(rows) {
+  const groups = [];
+  for (const row of rows) {
+    let group = groups.find((g) => g.id === row.group);
+    if (!group) groups.push(group = { id: row.group, title: row.group_title, rows: [] });
+    group.rows.push(row);
+  }
+  const table = $("ladder");
+  table.innerHTML = "";
+  state.rows = {};
+  const head = document.createElement("tr");
+  head.innerHTML = "<th>假设</th><th>机器基线</th><th>当前值（金额行填 ±%）</th><th>改动%</th><th>归因%</th><th>来源</th>";
+  table.append(head);
+  for (const group of groups) {
+    const band = document.createElement("tr");
+    band.innerHTML = `<td colspan="6" style="text-align:left;background:#eef0f3;font-weight:600">${group.title}</td>`;
+    table.append(band);
+    for (const row of group.rows) table.append(buildRow(row));
+  }
+}
+
+function buildRow(row) {
+  const tr = document.createElement("tr");
+  tr.className = row.changed ? "edited" : row.recomputed ? "recomputed" : (row.derived ? "locked" : "");
+  const badge = KIND[row.kind] ? `<span class="badge ${row.kind}">${KIND[row.kind]}</span>` : "";
+  // 说明只讲这行是什么、起什么作用；这次取到的数怎么算出来的（窗口、样本、护栏、取数凭证）挂在悬浮里。
+  const tip = [row.note, row.evidence && `凭证：${row.evidence}`].filter(Boolean).join("　");
+  const label = tip ? `<span title="${esc(tip)}">${esc(row.label)}</span>` : esc(row.label);
+  tr.innerHTML = `<td class="lbl">${label}${badge}</td><td>${esc(fmt(row.baseline, row.unit))}</td><td class="edit"></td>`
+    + `<td class="chg">${changeCell(row)}</td><td class="contrib">${signed(row.contribution_pct)}</td>`
+    + `<td class="src">${esc(row.source)}</td>`;
+  const cell = { row, tr, chg: tr.querySelector(".chg"), contrib: tr.querySelector(".contrib"), base: tr.children[1],
+                 yearInputs: {}, yearModes: {}, yearAbs: {} };
+  const holder = tr.querySelector(".edit");
+  cell.editHolder = holder;
+  if (!row.editable || row.derived || row.value_type === "text") {
+    holder.textContent = fmt(row.current, row.unit);
+    if (row.derived) {
+      holder.classList.add("derived");
+      holder.title = "级联结果，改上游即可自动重算";
+    }
+  } else if (row.value_type === "bool") {
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = Boolean(row.current);
+    input.addEventListener("change", schedule);
+    holder.append(input);
+    cell.input = input;
+  } else if (row.value_type === "year_map") {
+    const wrap = document.createElement("div");
+    wrap.className = "years";
+    for (const year of Object.keys(row.baseline).sort()) {
+      const base = row.baseline[year];
+      const mode = modeOf(row, base);
+      const input = document.createElement("input");
+      input.type = "number";
+      input.step = "any";
+      input.className = boxClass(row, mode);
+      if (mode === "delta") {
+        input.placeholder = "±%";
+        input.value = 0;
+      } else {
+        input.value = toBox(row, base, base, mode);
+      }
+      input.title = `${year} 基线 ${fmt(base, row.unit)}`
+        + (row.edit === "delta" ? (mode === "delta" ? "，填相比基线的百分比" : "，基线非正按绝对值改") : "");
+      input.addEventListener("input", schedule);
+      const span = document.createElement("span");
+      span.textContent = year;
+      wrap.append(span, input);
+      if (mode === "delta") {
+        const abs = document.createElement("span");
+        abs.className = "abs";
+        abs.textContent = fmt(base, row.unit);
+        wrap.append(abs);
+        cell.yearAbs = cell.yearAbs || {};
+        cell.yearAbs[year] = abs;
+      }
+      cell.yearInputs[year] = input;
+      cell.yearModes[year] = mode;
+    }
+    holder.append(wrap);
+  } else {
+    const mode = modeOf(row);
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = "any";
+    input.className = boxClass(row, mode);
+    if (mode === "delta") {
+      input.placeholder = "±%";
+      input.value = 0;
+      input.title = `相比机器基线 ${fmt(row.baseline, row.unit)} 的百分比改动`;
+    } else {
+      input.value = round2(displayValue(row));
+      if (row.edit === "delta") input.title = "基线为 0 或负，百分比没有意义，按绝对值改";
+    }
+    input.addEventListener("input", schedule);
+    holder.append(input);
+    cell.input = input;
+    cell.mode = mode;
+    if (mode === "delta") {
+      const abs = document.createElement("span");
+      abs.className = "abs";
+      abs.textContent = `→ ${fmt(row.current, row.unit)}`;
+      holder.append(abs);
+      cell.abs = abs;
+    }
+  }
+  state.rows[row.key] = cell;
+  return tr;
+}
+
+function changeCell(row) {
+  const change = row.change_pct;
+  if (change === null || change === undefined) return '<span class="dim">—</span>';
+  if (typeof change === "object") {
+    const moved = Object.entries(change).filter(([, v]) => v);
+    return moved.length ? moved.map(([y, v]) => `${y}${v > 0 ? "↑" : "↓"}`).join(" ") : '<span class="dim">0</span>';
+  }
+  return signed(change);
+}
+
+function refresh(data) {
+  syncBenchmark(data);
+  syncErpWindow(data);
+  $("derivation-link").href = `/derivation?code=${state.code}&run=${data.run_id || state.run}`;
+  for (const row of data.attribution.rows) {
+    const cell = state.rows[row.key];
+    if (!cell) continue;
+    cell.row = row;
+    cell.tr.className = row.changed ? "edited" : row.recomputed ? "recomputed" : (row.derived ? "locked" : "");
+    cell.base.textContent = fmt(row.baseline, row.unit);
+    cell.chg.innerHTML = changeCell(row);
+    cell.contrib.innerHTML = signed(row.contribution_pct);
+    // A read-only cell has no input to write back, so the cascade value would otherwise stay frozen
+    // at whatever the first render showed — the panel would print a rate the engine never used.
+    if (!cell.input && Object.keys(cell.yearInputs).length === 0) {
+      cell.editHolder.textContent = fmt(row.current, row.unit);
+      continue;
+    }
+    // ±% 框里装的是人工输入本身，回写会把 8 变成 7.999999——只更新旁边的绝对值读数。
+    if (row.value_type === "year_map") {
+      for (const [year, input] of Object.entries(cell.yearInputs)) {
+        const shown = row.current?.[year];
+        const abs = cell.yearAbs[year];
+        if (abs) abs.textContent = fmt(shown, row.unit);
+        if (cell.yearModes[year] === "delta" || input === document.activeElement) continue;
+        input.value = toBox(row, row.baseline[year], shown, cell.yearModes[year]);
+      }
+    } else if (cell.abs) {
+      cell.abs.textContent = `→ ${fmt(row.current, row.unit)}`;
+    } else if (cell.input && document.activeElement !== cell.input) {
+      if (row.value_type === "bool") cell.input.checked = Boolean(row.current);
+      else cell.input.value = round2(displayValue(row));
+    }
+  }
+  renderSummary(data);
+  renderMatrix(data);
+  renderSchedule(data);
+  renderNotices(data);
+}
+
+function renderSummary(data) {
+  const att = data.attribution;
+  const coe = att.rates.cost_of_equity, wacc = att.rates.wacc;
+  const useFcfe = att.method === "fcfe";
+  const rate = (useFcfe ? coe : wacc).map((v) => fmt(v, "pct")).join(" → ");
+  $("summary").innerHTML = [
+    card("每股价值", fmt(att.per_share), `基线 ${fmt(att.baseline_per_share)}　${signed(att.total_change_pct)}`),
+    card("折现率（级联）", rate, `${useFcfe ? "股权成本 rf+β·ERP" : "WACC 权益/债务加权"}　实际使用 ${fmt(att.rate, "pct")}`),
+    card("改动行数", String(att.edited_row_count), `归因合计 ${att.contribution_sum_pct === null ? "—" : fmt(att.contribution_sum_pct, "pct")}（与总变动不等，单行敏感性不可加）`),
+    card("用时", data.timings.total_ms + " ms", `evaluate ${data.timings.evaluate_count} 次，自洽性 ${data.timings.cross_check_ms} ms`),
+  ].join("");
+}
+const card = (title, value, note) => `<div class="card"><span>${title}</span><b>${value}</b><span class="muted">${note}</span></div>`;
+
+function renderMatrix(data) {
+  $("matrix").innerHTML = Object.entries(data.matrix).map(([key, cell]) => {
+    const [method, terminal] = key.split(":");
+    const on = method === data.attribution.method && terminal === data.attribution.terminal;
+    const warn = cell.warnings[0];
+    return `<div class="cell${on ? " on" : ""}" data-key="${key}" ${warn ? `title="${esc(warn)}"` : ""}>`
+      + `<i>${esc(method.toUpperCase())} / ${esc(terminal)}</i><small>${fmt(cell.rate, "pct")}</small><b>${fmt(cell.per_share)}</b></div>`;
+  }).join("");
+  $("matrix").querySelectorAll(".cell").forEach((el) => el.addEventListener("click", () => {
+    const [method, terminal] = el.dataset.key.split(":");
+    $("method").value = method;
+    $("terminal").value = terminal;
+    recompute(true);
+  }));
+}
+
+function renderSchedule(data) {
+  const lines = data.attribution.schedule;
+  const useFcff = data.attribution.method === "fcff";
+  if (!lines.length) { $("schedule").innerHTML = "<tr><td class='muted'>当前场景没有可展示的折现明细</td></tr>"; return; }
+  const head = "<tr><th>年份</th><th>折现期</th><th>营收</th><th>EBIT</th><th>税后经营利润</th><th>利息</th><th>FCFF</th><th>FCFE</th><th>折现因子</th><th>现值</th></tr>";
+  // 首年离报表截止日不足一整年时，这一行的金额只是那一年的一个残期，年份格里得自己说明，否则看着像取数取漏了。
+  const yearCell = (l) => (l.stub && l.stub < 1 ? `${l.year}<span class="muted"> 残期 ${Number(l.stub).toFixed(2)} 年</span>` : String(l.year));
+  $("schedule").innerHTML = head + lines.map((l) => `<tr><td>${yearCell(l)}</td><td>${l.t}</td><td>${fmt(l.revenue)}</td>`
+    + `<td>${fmt(l.ebit)}</td><td>${fmt(l.nopat)}</td><td>${fmt(l.interest)}</td><td>${fmt(l.fcff)}</td><td>${fmt(l.fcfe)}</td>`
+    + `<td>${Number(l.discount_factor).toFixed(4)}</td><td>${fmt(useFcff ? l.pv_fcff : l.pv_fcfe)}</td></tr>`).join("");
+}
+
+function renderNotices(data) {
+  const att = data.attribution;
+  const notes = [];
+  if (!att.edited_row_count) notes.push(["muted", "尚未修正：机器基线即当前值。改动任一数字后自动重算，归因列给出「只把这一行退回基线」的影响。"
+    + esc(options.edit_note || "")]);
+  if (att.unpriced_edits.length) notes.push(["alert", `以下改动未被定价（不在引擎输入集合）：${esc(att.unpriced_edits.join("、"))}`]);
+  if (data.cross_check.length) notes.push(["muted", "自洽性：" + esc(data.cross_check.join("　|　"))]);
+  const bm = data.benchmark && data.benchmark.code ? `　市场基准 ${benchmarkText(data.benchmark)}` : "";
+  notes.push(["muted", `基线文件 ${esc(data.baseline)}　报表截至 ${esc(data.as_of)}　${esc(data.ticker.name)}${bm}`]);
+  const saved = data.saved && data.saved.overrides && Object.keys(data.saved.overrides).length;
+  if (saved && !att.edited_row_count) {
+    notes.push(["strip-ok", `已保存的修正（${esc(Object.keys(data.saved.overrides).join("、"))}，保存于 ${esc(data.saved.saved_at)}）：`
+      + '<button id="restore">载入</button>']);
+  }
+  $("notices").innerHTML = notes.map(([cls, text]) => `<div class="strip ${cls}">${text}</div>`).join("");
+  const restore = $("restore");
+  if (restore) restore.addEventListener("click", () => applyOverridesToInputs(data.saved.overrides));
+  const seen = new Set();
+  const list = [...(data.warnings || []), ...(att.warnings || [])].filter((w) => !seen.has(w) && seen.add(w));
+  $("warnings").innerHTML = list.map((w) => `<div class="strip warn">${esc(w)}</div>`).join("")
+    || '<div class="strip muted">无警示</div>';
+}
+
+let timer = null;
+function schedule() { clearTimeout(timer); timer = setTimeout(() => recompute(false), 220); }
+
+async function recompute(rebuild) {
+  const overrides = collectOverrides();
+  if (overrides === null) { $("status").textContent = "输入不是数字，未重算"; return; }
+  state.overrides = overrides;
+  const seq = ++state.seq;
+  $("status").textContent = "重算中…";
+  try {
+    const response = await fetch("/api/recompute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code: state.code, run: state.run, overrides,
+        method: $("method").value, terminal: $("terminal").value,
+        rate: $("rate").value.trim(), mid_year: $("midyear").value === "" ? null : $("midyear").value === "1",
+      }),
+    });
+    const data = await response.json();
+    if (seq !== state.seq) return;
+    if (!response.ok) { $("status").textContent = "✗ " + data.error; return; }
+    state.data = data;
+    if (rebuild || Object.keys(state.rows).length === 0) buildTable(data.attribution.rows);
+    refresh(data);
+    $("status").textContent = `✓ ${data.timings.total_ms} ms`;
+  } catch (exc) {
+    if (seq === state.seq) $("status").textContent = "✗ 请求失败: " + exc;
+  }
+}
+
+async function loadPanel() {
+  // 这里不预告「联网」：这一次到底联不联网由上面那行新鲜度说了算（名录否决、或这批仍在有效期内都不联）。
+  if (!state.run) { $("status").textContent = "该代码还没有取数批次：点「取数估值」，联不联网看上面那行"; return; }
+  const query = new URLSearchParams({ code: state.code, run: state.run, method: $("method").value, terminal: $("terminal").value });
+  const response = await fetch("/api/panel?" + query);
+  const data = await response.json();
+  if (!response.ok) { $("status").textContent = "✗ " + data.error; return; }
+  state.overrides = {};
+  buildTable(data.attribution.rows);
+  state.data = data;
+  refresh(data);
+  $("status").textContent = `✓ ${data.timings.total_ms} ms`;
+}
+
+// ---------------------------------------------------------------- 取数估值
+// 基准下拉、新鲜度判断、起作业与轮询都在 common.js 的「取数台」里，与推导图共用一份；
+// 这一页只负责把跑完的批次读回表格（下面的 configureFetchDesk）。
+
+// ---------------------------------------------------------------- ERP 窗口：下拉就是改那一行
+
+// 下拉不新增任何写入通路：选中一档就把那一档的实测数写进「股权风险溢价（级联采用）」的框里，
+// 之后的重算、归因、保存修正与手改那个框完全同一条路（common.js 的 renderErpWindow 判当前选中谁）。
+function syncErpWindow(data) {
+  renderErpWindow($("erpwindow"), data.erp_windows, state.overrides.erp);
+}
+
+// 空值＝退回级联所取；「自定义」＝这个数不是任何窗口的实测（手改过那个框、或载入的修正来自别的批次），
+// 此时下拉不写进表里，让表保持用户手改的数。
+function applyErpWindow(raw) {
+  const cell = state.rows.erp;
+  if (!cell || raw === "custom") return;
+  applyOverridesToInputs(raw === "" ? { erp: cell.row.baseline } : { erp: Number(raw) });
+}
+
+// ---------------------------------------------------------------- 启动
+
+// 取数估值这一整套（基准下拉、新鲜度判断、起作业与轮询）在 common.js 的「取数台」里，与推导图共用一份。
+// 这一页只交回 reload：作业跑完把新批次读进表格。
+
+async function boot() {
+  stickHeader();
+  configureFetchDesk({ reload: async () => { await loadPanel(); } });
+  // 搜索页带 ?code=&run= 跳进来，所以代码/批次先看查询串，没有再退回「已取数列表的第一个」。
+  const params = new URLSearchParams(location.search);
+  const wanted = (params.get("code") || "").replace(/[^0-9]/g, "").slice(0, 6);
+  await refreshOptions();
+  if (wanted) {
+    state.code = wanted;
+    $("code").value = wanted;
+  } else if (options.codes.length) {
+    state.code = options.codes[0].code;
+    $("code").value = state.code;
+  }
+  fillRuns();
+  const pinned = (params.get("run") || "").trim();
+  if (pinned && (entryFor(state.code) || {}).runs?.some((r) => r.run_id === pinned)) {
+    state.run = pinned;
+    $("run").value = pinned;
+  }
+  $("code").addEventListener("change", async () => { state.code = typedCode(); $("code").value = state.code; fillRuns(); await loadPanel(); await showFreshness(); });
+  $("run").addEventListener("change", async () => { state.run = $("run").value; await loadPanel(); await showFreshness(); });
+  bindFetchControls();
+  // 「ERP 窗口」下拉与直接改级联那一行是同一件事，所以这里复用同一套写框＋重算，不另开通路。
+  $("erpwindow").addEventListener("change", (event) => applyErpWindow(event.target.value));
+  for (const id of ["method", "terminal", "midyear"]) $(id).addEventListener("change", () => recompute(true));
+  $("rate").addEventListener("input", schedule);
+  $("showall").addEventListener("change", () => toggleUnedited());
+  $("reset").addEventListener("click", () => { state.overrides = {}; loadPanel(); });
+  $("reload").addEventListener("click", () => location.reload());
+  $("save").addEventListener("click", async () => {
+    const body = {
+      code: state.code, run: state.run, overrides: state.overrides,
+      method: $("method").value, terminal: $("terminal").value,
+      rate: $("rate").value.trim(), mid_year: $("midyear").value === "" ? null : $("midyear").value === "1",
+      per_share: state.data?.attribution.per_share,
+    };
+    const response = await fetch("/api/save", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const result = await response.json();
+    $("status").textContent = response.ok ? "✓ 已保存 " + result.saved : "✗ " + result.error;
+  });
+  await loadPanel();
+  toggleUnedited();
+  await showFreshness();
+  if (!options.codes.length) $("status").textContent = "runs/ 下还没有基线：输入 6 位代码后点「取数估值」";
+  // 搜索页点「取数估值」跳过来时直接开跑，不用再点一次——两只手按同一个按钮没有意义。
+  // 该不该联网由后台判断，所以这里连「复现快照」也算跑完了一次按钮。
+  if (params.get("go") === "fetch" && state.code) fetchValuation();
+}
+
+function fillRuns() {
+  const runs = (entryFor(state.code) || {}).runs || [];
+  $("run").innerHTML = runs.length
+    ? runs.map((r) => `<option value="${r.run_id}">${r.run_id} · 截至 ${r.as_of}${r.edited ? " · 已修正" : ""}</option>`).join("")
+    : '<option value="">（无批次）</option>';
+  state.run = runs.length ? runs[0].run_id : "";
+}
+
+function toggleUnedited() {
+  const show = $("showall").checked;
+  for (const cell of Object.values(state.rows)) {
+    cell.tr.classList.toggle("hidden", !show && !cell.row.changed);
+  }
+}
+
+function applyOverridesToInputs(overrides) {
+  for (const [key, value] of Object.entries(overrides || {})) {
+    const cell = state.rows[key];
+    if (!cell) continue;
+    const row = cell.row;
+    if (row.value_type === "year_map") {
+      for (const [year, item] of Object.entries(value)) {
+        const input = cell.yearInputs[year];
+        if (input) input.value = toBox(row, row.baseline[year], item, cell.yearModes[year]);
+      }
+    } else if (row.value_type === "bool" && cell.input) {
+      cell.input.checked = Boolean(value);
+    } else if (cell.input) {
+      cell.input.value = toBox(row, row.baseline, value, cell.mode);
+    }
+  }
+  recompute(false);
+}
+
+boot();
+</script>
+</body>
+</html>
