@@ -1,0 +1,21 @@
+# 取数凭证与估值批次：本地一次性产物，重跑一条命令就能再生，不进版本库
+runs/
+
+# 启动时自动刷新的股票名录索引（scripts/update_universe.py 的产物）
+data/universe.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行日志与临时探针
+*.log
+mockups/
+
+# 操作系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
