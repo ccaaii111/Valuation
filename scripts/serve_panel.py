@@ -5,7 +5,8 @@
     python scripts/serve_panel.py --refresh-universe   # 先重建股票索引再开面板
 
 From Windows Explorer, double-click start_panel.bat in the repository root — same thing, plus it
-keeps the console open so a startup error is readable.
+keeps the console open so a startup error is readable. On a machine that has nothing installed yet,
+deploy_panel.bat creates .venv, installs requirements.txt, then runs this file.
 """
 from __future__ import annotations
 
