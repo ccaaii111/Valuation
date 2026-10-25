@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DCF 估值台</title>
+<link rel="stylesheet" href="/assets/app.css">
+<style>
+  main { max-width:900px; }
+  .choices { display:flex; flex-wrap:wrap; gap:14px; }
+  .choice { display:block; flex:1 1 280px; background:#fff; border:1px solid var(--line); border-radius:10px;
+            padding:18px 20px; color:inherit; text-decoration:none; }
+  .choice:hover { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .choice b { display:block; font-size:17px; margin-bottom:6px; }
+  .choice p { margin:0; color:var(--muted); font-size:13px; }
+  .choice i { font-style:normal; }
+  .choice .tags { display:block; margin-top:10px; }
+  .choice .tags span { display:inline-block; font-size:11px; padding:1px 7px; border-radius:9px;
+                       background:#e8ebf0; color:#39404a; margin-right:5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>DCF 估值台</h1>
+  <span id="universe" class="muted"></span>
+</header>
+<main>
+  <div class="choices">
+    <a class="choice" href="/search">
+      <b>估值模型 <i>FCFF / FCFE</i></b>
+      <p>输入股票代码、简拼或名称，先搜到票，再联网取免费公开数据生成机器基线，然后在面板上逐行改假设、看单行归因。</p>
+      <p class="tags"><span>无风险利率</span><span>实测 β</span><span>ERP 惯例</span><span>三表取数</span><span>一致预期</span></p>
+    </a>
+  </div>
+  <h2>口径</h2>
+  <div class="strip muted">
+    每个输入都必须在某处留痕，改过的数必须能追溯到某个来源或某次人工修正。<b>runs/ 下每一批次存一份当次联网取到的原始响应</b>，
+    面板只复现已落盘的批次、不重新联网；要新数据就重新点「取数估值」。
+  </div>
+</main>
+<script src="/assets/common.js"></script>
+<script>
+boot();
+async function boot() {
+  stickHeader();
+  try {
+    const meta = await (await fetch("/api/universe")).json();
+    if (meta.total) {
+      const age = Math.floor((Date.now() - new Date(meta.generated_at).getTime()) / 86400000);
+      $("universe").textContent = `股票索引 ${meta.total} 只 · 生成于 ${String(meta.generated_at).slice(0, 10)}（${age} 天前）`;
+    }
+  } catch (exc) { /* 索引还没拉过：首页不因此报错，搜索页会给出指引 */ }
+}
+</script>
+</body>
+</html>
