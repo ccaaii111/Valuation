@@ -11,6 +11,10 @@ S = 归母净利润 − 扣非归母净利润。它从不说明那笔偶发落�
 
 只用年报：A 股偶发项年末一次算清，单季 S 年内会反号（紫金 2025 四季是 2.85／13.82／20.69／−26.83 亿），
 拿它差分进 LTM 分子等于塞进一个随 Q4 滚入而跳变的阶梯函数。
+
+公允价值变动这一行不参与搬运：级联的 EBIT 已经把它整行从营业利润里减掉（`assumptions.EBIT_ADJUSTMENTS`），
+而官方 S 仍含这一笔，所以反推的税前偶发额要先减掉它，位置份额也按剩下的科目重算——否则同一笔 FV
+会被从 EBIT 里走两次：为正时把 EBIT 压低，为负时抬高。
 """
 from __future__ import annotations
 
@@ -60,7 +64,8 @@ CAPTIONS = {
 
 
 def _fmt_yi(amount: float | None) -> str:
-    return "—" if amount is None else f"{amount / 1e8:,.2f} 亿元"
+    # 先按亿元四舍五入再格式化：浮点相减会留下 −1e−7 这种尾巴，直接格式化会印成「−0.00 亿元」。
+    return "—" if amount is None else f"{round(amount / 1e8, 2) + 0.0:,.2f} 亿元"
 
 
 @dataclass(frozen=True)
@@ -100,8 +105,9 @@ class YearNormalization:
     non_recurring: float | None = None  # S：归母、税后
     tax_rate: float | None = None
     minority_share: float | None = None
-    position: float | None = None  # w：A 堆在总偶发额绝对值里的份额
+    position: float | None = None  # w：A 堆在总偶发额绝对值里的份额（公允价值变动已从两堆里剔除）
     gross: float | None = None  # 反推成税前总额的那个数
+    fairvalue: float | None = None  # 当年公允价值变动收益（正数为收益），已由 EBIT 口径整行剔除
     strip: float | None = None  # 从 EBIT 里剔掉的金额（元）
     ebit_normalized: float | None = None
     e1_residual: float | None = None
@@ -117,6 +123,7 @@ def normalize_year(year: int, row: dict | None, ebit: float | None) -> YearNorma
 
     inside = pile(row, IN_EBIT_STACK)
     below = pile(row, BELOW_EBIT_STACK)
+    fairvalue = P.num(row, "FAIRVALUE_CHANGE_INCOME") or 0.0
     operate = P.num(row, "OPERATE_PROFIT")
     total_profit = P.num(row, "TOTAL_PROFIT")
     revenue = P.num(row, "TOTAL_OPERATE_INCOME")
@@ -125,7 +132,7 @@ def normalize_year(year: int, row: dict | None, ebit: float | None) -> YearNorma
     def rejected(reason: str, **extra) -> YearNormalization:
         return YearNormalization(
             year, ebit, False, reason, e1_residual=_e1(), e2_residual=_e2(),
-            in_ebit=inside, below_ebit=below, **extra,
+            in_ebit=inside, below_ebit=below, fairvalue=fairvalue, **extra,
         )
 
     def _e1() -> float | None:
@@ -183,8 +190,12 @@ def normalize_year(year: int, row: dict | None, ebit: float | None) -> YearNorma
 
     gross = s / denominator
     # w 只取绝对值占比：符号交给 gross-up 那一层，位置份额不能把调整额改成反号。
-    position = inside.magnitude / (inside.magnitude + below.magnitude)
-    strip = gross * position
+    # 公允价值变动整行已经不在 EBIT 里，所以它既从反推额里减去，也退出两堆的绝对值分母；
+    # 剩下的偶发额才轮到位置判断，否则同一笔 FV 会从 EBIT 里走两次。
+    inside_other = max(0.0, inside.magnitude - abs(fairvalue))
+    other_total = inside_other + below.magnitude
+    position = inside_other / other_total if other_total else 0.0
+    strip = (gross - fairvalue) * position
     if (ebit - strip) * ebit <= 0:
         # 唯一的规模护栏：正常化可以把盈利做薄、把亏损做窄，但不许把营业利润推过零、改成反号。
         # 盘上 132 个恒等式闭合的年报行实测触发 0 次；被它拦下的都是「剔除额比整年营业利润还大」这种
@@ -196,7 +207,7 @@ def normalize_year(year: int, row: dict | None, ebit: float | None) -> YearNorma
 
     return YearNormalization(
         year, ebit, True, "", non_recurring=s, tax_rate=tax_rate, minority_share=minority_share,
-        position=position, gross=gross, strip=strip, ebit_normalized=ebit - strip,
+        position=position, gross=gross, fairvalue=fairvalue, strip=strip, ebit_normalized=ebit - strip,
         e1_residual=e1, e2_residual=e2, in_ebit=inside, below_ebit=below,
     )
 
@@ -256,8 +267,9 @@ def evidence(items: Iterable[YearNormalization]) -> str:
         if item.accepted:
             lines.append(
                 f"{item.year} 剔除 {_fmt_yi(item.strip)}（S {_fmt_yi(item.non_recurring)}，"
-                f"税盾 {item.tax_rate:.2%}、少数 {item.minority_share:.2%}、位置 w {item.position:.3f}，"
-                f"{residuals}）"
+                f"反推税前 {_fmt_yi(item.gross)}、其中公允价值变动 {_fmt_yi(item.fairvalue)} 已由 EBIT 口径整行剔除，"
+                f"税盾 {item.tax_rate:.2%}、少数 {item.minority_share:.2%}、"
+                f"位置 w {item.position:.3f}（按剔除公允价值变动后的两堆），{residuals}）"
             )
         else:
             # 恒等式不闭合那条理由里已经带着 E1/E2 的数，再追一个括注就是把同一对残差写两遍。
