@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from backend.data import fundamentals, macro, market, prices, universe
+from backend.data import fundamentals, macro, market, marketcache, prices, universe
 from backend.data.em_company import Ticker
 from backend.data.transport import RunStore, Transport
 from backend.model.assumptions import BetaNotApplicable, build_ladder
@@ -116,6 +116,7 @@ class BuildOptions:
     terminal_basis: str = "conservative"
     terminal_growth: float | None = None
     horizon: int | None = None
+    no_market_cache: bool = False
 
 
 @dataclass
@@ -170,18 +171,22 @@ def build(options: BuildOptions, progress: Progress | None = None) -> BuildResul
     # 无论这批的基准是从联网预取里切的、还是复现时换的，manifest 记的都是「这一批实际按谁算的」。
     store.benchmark = prices.benchmark_code(options.benchmark)
 
+    # 国债序列、指数收盘与全市场股息率跟估哪只票无关：本机缓存取到最新一次就复用，同一根收盘轴内不再下网。
+    # 复现走不到这里（批次里已有 raw）；`--no-market-cache` 与面板的强制重取绕过缓存，去线上要一份新答复。
+    cache = None if options.no_market_cache else marketcache.Cache()
+
     if options.no_risk_free:
         rf_window, rf_source = None, "unavailable: 已跳过 (--no-risk-free)"
     else:
         say("risk_free")
-        rf_window, rf_source = macro.risk_free_stats(store, live=not replaying)
+        rf_window, rf_source = macro.risk_free_stats(store, live=not replaying, cache=cache)
     rf_value, rf_basis = pick_risk_free(rf_window, options.risk_free, options.risk_free_basis)
     if options.risk_free is not None:
         rf_source = "人工输入 (--risk-free)"
 
     # 市场序列一趟只并发取一次：所有基准的指数收盘加它们的全收益孪生，β 与 ERP 两份凭证各按自己的窗口切。
     # 复现不建这个账本——快照里已经有序列了，联网的活儿一次都不该做。
-    series = None if replaying else prices.IndexSeriesMap().load()
+    series = None if replaying else prices.IndexSeriesMap(cache=cache).load()
 
     if options.beta is not None:
         # 人工 β 不必再花一次行情取数；raw/ 里没有价格快照本身就是「这步没跑」的痕迹。
@@ -204,7 +209,9 @@ def build(options: BuildOptions, progress: Progress | None = None) -> BuildResul
     say("market_returns")
     # ERP 的无风险腿复用同一份 risk_free 凭证，不另起序列；取不到就当没测，绝不中断建链——
     # 与 β 不同，这一行有 documented 的惯例兜底值（见 assumptions.pick_erp）。
-    market_payload, market_source = market.market_history(store, options.benchmark, live=not replaying, series=series)
+    market_payload, market_source = market.market_history(
+        store, options.benchmark, live=not replaying, series=series, cache=cache
+    )
     erp_stats = (
         market.window_stats(market_payload, store.load(macro.RAW_NAME))
         if market_payload is not None
@@ -219,6 +226,8 @@ def build(options: BuildOptions, progress: Progress | None = None) -> BuildResul
             normalize=options.normalize,
             prices=price_payload,
             prices_source=price_source,
+            # β 的市场腿跟 ERP 那条腿取同一个孪生：价格指数与全收益指数不是同一个市场组合。
+            benchmark_leg=(market_payload or {}).get("total_return"),
             rf_window=rf_window,
             rf_basis=rf_basis,
             terminal_basis=options.terminal_basis,
