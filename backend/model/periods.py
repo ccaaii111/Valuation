@@ -97,6 +97,30 @@ def ltm(rows: Iterable[dict], *keys: str, anchor: str = "") -> float | None:
     return current_ytd + annual - comparable_ytd
 
 
+def ltm_flow(rows: Iterable[dict], *keys: str) -> float | None:
+    """现金流科目的 LTM：滚动窗口里没报数的那几期按 0 计。
+
+    与 `ltm` 的差别只在空值的含义。利润表、资产负债表的空格是「没披露」，凑不齐就宁可不出数；
+    现金流量表的空格是「这笔现金没发生」——东财对没有发生的发债、借款项目留空而不是写 0，
+    严格口径会把整条 LTM 判成缺失，等于把真实发生的融资当成零。
+    """
+    ordered = sort_desc(list(rows))
+    if not ordered:
+        return None
+    head = ordered[0]
+    current = num(head, *keys)
+    if current is None:
+        return None
+    period, year = period_of(head), fiscal_year(head)
+    if period == "FY":
+        return current
+    if period is None or year is None:
+        return None
+    prior_annual = next((r for r in ordered if fiscal_year(r) == year - 1 and period_of(r) == "FY"), None)
+    prior_same = next((r for r in ordered if report_date(r) == f"{year - 1}-{head['REPORT_DATE'][5:10]}"), None)
+    return current + (num(prior_annual, *keys) or 0.0) - (num(prior_same, *keys) or 0.0)
+
+
 def same_quarter_last_year(rows: Iterable[dict]) -> dict | None:
     """The balance-sheet row for the same quarter-end one year earlier, or None if never reported."""
     ordered = sort_desc(list(rows))
