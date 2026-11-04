@@ -84,7 +84,7 @@ def test_rate_primitives_cascade_into_value() -> None:
     check("回退 β 即回到基线折现率", abs(row["rate_if_reverted"] - INPUTS["wacc"]) < 1e-9, f"{row['rate_if_reverted']}")
     check("改 β 后每股值随折现率下移", report["per_share"] < report["baseline_per_share"])
 
-    tax = attribute(LADDER, {"tax_rate_ltm": INPUTS["tax_rate_ltm"] + 0.10})
+    tax = attribute(LADDER, {"tax_rate_ltm": INPUTS["tax_rate_ltm"] - 0.05})
     check("税率改动只动 WACC 不动股权成本", tax["rates"]["cost_of_equity"][0] == tax["rates"]["cost_of_equity"][1],
           str(tax["rates"]))
     check("税率改动进 WACC", tax["rates"]["wacc"][1] != INPUTS["wacc"], str(tax["rates"]["wacc"]))
