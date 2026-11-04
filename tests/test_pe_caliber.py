@@ -120,15 +120,24 @@ def test_helper_wording_covers_every_guard() -> None:
 
 
 def test_the_engine_refuses_a_negative_multiple() -> None:
-    """旧护栏只拦 None 与 0：负倍数乘负净利会折出一个正终值（盘上 000002、600408、688561 都采到过负值）。"""
+    """旧护栏只拦 None 与 0：负倍数乘负末年会折出一个正终值（盘上 000002、600408、688561 都采到过负市盈率）。
+
+    退出倍数两臂都改按 EV/EBITDA 计价之后，引擎那一层的护栏跟着搬到 `exit_ev_ebitda` 这一行上；
+    市盈率两行（`pe_ttm`、`exit_pe`）退出定价通路，只剩级联与凭证两层的钉子。
+    """
     inputs = dict(flat(ladder_for(PUSH2_PAYLOAD)))
-    for pe in (-22.87, 0, None):
-        inputs["pe_ttm"] = pe
+    for multiple in (-22.87, 0):
+        inputs["exit_ev_ebitda"] = multiple
         result = evaluate(inputs, "fcfe", "exit_multiple")
-        check(f"退出市盈率 {pe} 不折出终值", result.per_share is None and "非正" in result.warnings[0],
+        check(f"退出 EV/EBITDA {multiple} 不折出终值", result.per_share is None and "非正" in result.warnings[0],
               f"{result.per_share} / {result.warnings[:1]}")
-    inputs["pe_ttm"] = 12.5
+    inputs["exit_ev_ebitda"] = 12.5
     check("正倍数照常出数", evaluate(inputs, "fcfe", "exit_multiple").per_share is not None)
+    inputs.pop("exit_ev_ebitda")
+    inputs.pop("pe_ttm")
+    check("两行都不给时按市值与 EBITDA 反推的隐含倍数出数",
+          evaluate(inputs, "fcfe", "exit_multiple").per_share is not None,
+          str(evaluate(inputs, "fcfe", "exit_multiple").warnings[:1]))
 
 
 def test_editing_the_denominator_reprices_the_ratio() -> None:
