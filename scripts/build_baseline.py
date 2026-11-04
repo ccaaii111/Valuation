@@ -69,6 +69,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="生成假设链基线")
     parser.add_argument("code")
     parser.add_argument("--from-run", help="复现既有取数批次的原始答复，不重新联网；结果写进一个新批次，源批次不动")
+    parser.add_argument(
+        "--no-market-cache",
+        action="store_true",
+        help="绕过 data/market_cache/ 里的市场级缓存（10Y 国债序列、指数收盘、全市场股息率），去线上要一份新答复；"
+        "默认同一根收盘轴内已取过就复用，每批 raw/ 与 manifest 照旧记真正联网那一刻",
+    )
     parser.add_argument("--no-risk-free", action="store_true", help="跳过无风险利率取数，留空待人工填")
     parser.add_argument("--risk-free", type=float, dest="risk_free", help="手工指定无风险利率（小数），覆盖取数结果")
     parser.add_argument(
@@ -137,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         terminal_basis=args.terminal_growth_basis,
         terminal_growth=args.terminal_growth,
         horizon=args.horizon,
+        no_market_cache=args.no_market_cache,
     )
     try:
         result = build(options)
