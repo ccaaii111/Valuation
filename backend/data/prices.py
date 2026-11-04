@@ -24,6 +24,7 @@ from datetime import date, timedelta
 from io import StringIO
 from typing import Any, Callable
 
+from backend.data import marketcache
 from backend.data.transport import Fetched, RunStore, now_iso
 
 RAW_NAME = "price_history"
@@ -209,6 +210,10 @@ class IndexSeriesMap:
 
     单条序列取不到只让它自己不进预取集合（`closes` 对那个代码照抛），整批取数不因此作废——切到没预取
     到的那个基准时，新鲜度会像从前一样要求联网重取，而不是拿一条缺腿的序列假装算过。
+
+    `cache` 是本机的市场级缓存：这些序列与取哪只票无关，同一根收盘轴内命中就不联网、连线程池都不开
+    （那条坑也就整个绕过了）。命中条件除了日期，还要这份账本真的覆盖本次请求的代码与窗口，且上一趟
+    没有任何一条失败——缺腿的账本复用一整天，等于把一次抖动固化成默认答复。
     """
 
     def __init__(
@@ -217,18 +222,40 @@ class IndexSeriesMap:
         history_days: int = LONG_HISTORY_DAYS,
         workers: int = WORKERS,
         loader: Callable[[str, int], dict[str, float]] = series_loader,
+        cache: marketcache.Cache | None = None,
     ) -> None:
         self.codes = [str(code).strip() for code in codes]
         self.history_days = history_days
         self.workers = max(1, workers)
         self._loader = loader
+        self._cache = cache
         self._lock = threading.Lock()
         self._series: dict[str, dict[str, float]] = {}
         self._failed: dict[str, str] = {}
         self._loaded = False
+        self._from_cache = False
+        # 这份账本真正联网的那一刻：命中缓存时它是缓存里那次，落网时它是这一趟结束时。raw 凭证的取数时刻抄它。
+        self._fetched_at = now_iso()
+
+    @property
+    def fetched_at(self) -> str:
+        return self._fetched_at
+
+    @property
+    def from_cache(self) -> bool:
+        """这一本的序列是不是本机缓存端回来的——留痕要能回答「这一批到底有没有碰过线上」。"""
+        return self._from_cache
 
     def load(self) -> "IndexSeriesMap":
         if self._loader is series_loader:
+            cached = self._cached_book()
+            if cached is not None:
+                with self._lock:
+                    if not self._loaded:
+                        self._series, self._fetched_at = cached
+                        self._from_cache = True
+                        self._loaded = True
+                    return self
             _akshare()  # 池子开工前把慢 import 落在发起线程上，见 _akshare 的说明
             _warm_v8()  # import 还不够：进程里第一次 MiniRacer 构造必须先单独发生一次，见 _warm_v8 的说明
         with self._lock:  # 锁里跑网络没有代价：并发在池子里，别人不排队等这份账本。
@@ -240,8 +267,36 @@ class IndexSeriesMap:
                         self._failed[code] = outcome["error"]
                     else:
                         self._series[code] = outcome["closes"]
+            self._fetched_at = now_iso()
             self._loaded = True
+            self._save_cached()
             return self
+
+    def _cached_book(self) -> tuple[dict[str, dict[str, float]], str] | None:
+        """命中就交回 (整本序列, 它真正联网的时刻)；覆盖不上或判旧就交回 None，联网那条路照原样走。"""
+        cached = self._cache.read(marketcache.INDEX_SERIES) if self._cache is not None else None
+        if cached is None:
+            return None
+        book = cached.payload or {}
+        series = book.get("closes") or {}
+        if int(book.get("window_days") or 0) < self.history_days:
+            return None
+        # 只认「整本都取到了」的那一趟：缺一条就不算命中，也不落盘，下一次仍然会去线上补齐。
+        if not series or any(not isinstance(series.get(code), dict) or not series[code] for code in self.codes):
+            return None
+        return {code: dict(series[code]) for code in self.codes}, cached.fetched_at
+
+    def _save_cached(self) -> None:
+        if self._cache is None or self._failed or not self._series:
+            return
+        self._cache.save(
+            marketcache.INDEX_SERIES,
+            {"window_days": self.history_days, "closes": self._series},
+            fetched_at=self._fetched_at,
+            last_day=marketcache.last_day_of([max(closes) for closes in self._series.values() if closes]),
+            source=f"akshare {INDEX_FUNC}+{CSINDEX_FUNC}",
+            url=f"{SOURCE_URL} ; {CSINDEX_URL}",
+        )
 
     def _one(self, code: str) -> dict:
         try:
@@ -311,11 +366,14 @@ def fetch_all(secucode: str, series: IndexSeriesMap, benchmark: str = DEFAULT_BE
         "benchmarks": book,
         "unavailable": missing,
     }
+    if series.from_cache:
+        # 复用要留在凭证里：这份答复与联网那一版一模一样，差别只在它不是这一批下的线，以及它是几点下的。
+        payload["reused"] = {"指数收盘": series.fetched_at}
     text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return Fetched(
         name=RAW_NAME,
         url=payload["url"],
-        fetched_at=now_iso(),
+        fetched_at=series.fetched_at,  # 指数腿真正联网的那一刻；命中缓存时它早于本次建链，个股腿仍是刚取的
         sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         payload=payload,
     )
@@ -373,8 +431,9 @@ def price_history(
         if not live:
             return None, f"批次 {store.snapshot_ref} 未记录行情快照，--from-run 不重新联网"
 
+    book = series if series is not None else IndexSeriesMap()
     try:
-        item = fetch_all(secucode, (series or IndexSeriesMap()).load(), benchmark)
+        item = fetch_all(secucode, book.load(), benchmark)
     except (PricesUnavailable, ValueError) as exc:
         return None, f"unavailable: {exc}"
 
@@ -387,4 +446,5 @@ def price_history(
             f"唯独没有 {code}——{item.payload['unavailable'].get(code) or '原因未记录'}"
         )
     func, _ = index_channel(code)
-    return view, f"akshare 个股新浪 + 指数{CHANNEL_LABELS[func]} @ {item.fetched_at}"
+    cached = "，指数腿复用本机市场缓存" if book.from_cache else ""
+    return view, f"akshare 个股新浪 + 指数{CHANNEL_LABELS[func]} @ {item.fetched_at}{cached}"
