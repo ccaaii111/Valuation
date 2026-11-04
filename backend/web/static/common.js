@@ -135,7 +135,9 @@ const benchmarkText = (b) => `${esc(b.name || b.code)}${b.total_return ? " · �
 const BENCHMARK_HINT = "β 与股权风险溢价共用的那个指数（等同 CLI 的 --benchmark）：两处「市场」必须是同一个东西。"
   + "标「全收益」者，ERP 的市场腿直接取它的中证全收益指数孪生；没有孪生的退回「价格指数 + 乐咕两市股息率」。"
   + "下拉显示的是这一批快照实际用的基准。一次取数已把下拉里每个基准的收盘序列都存进同一份凭证，"
-  + "所以换成下拉里的另一个基准不联网——按下只会另开一个批次复现；要换成下拉之外的代码才需要重新取数。";
+  + "所以换成下拉里的另一个基准这一步不联网：这批数据还在有效期内时，换过去就自动另开一个批次复现；"
+  + "这批已有来源过期时，换基准不改变要联网的事实，按下「取数估值」整批重取。"
+  + "要换成下拉之外的代码才必须联网补指数那条腿。";
 
 async function refreshOptions() {
   options = await (await fetch("/api/options")).json();
@@ -164,8 +166,11 @@ function syncBenchmark(data) {
 
 // 后台按分源阈值（报价=当日收盘、行情=新交易周、三表=披露截止日、一致预期与 rf=30 天）决定这次是
 // 联网重取还是复现快照，所以按钮旁这一行要先说清「上一批还作不作数」，否则点下去没反应像坏了。
+// `freshness` 存最近一次判据原文：换基准那条自动通路只读它，不在页面里另算一遍「这次联不联网」。
+let freshness = null;
 async function showFreshness() {
   const box = $("freshness");
+  freshness = null;
   if (!box) return;
   if (!state.code) { box.textContent = ""; $("refetch").hidden = true; return; }
   const query = new URLSearchParams({ code: state.code, run: state.run, beta: betaValue(), benchmark: benchValue() });
@@ -181,12 +186,19 @@ async function showFreshness() {
     $("refetch").hidden = true;
     return;
   }
+  freshness = out;
   const age = out.age_hours === null ? "" : ` · ${out.age_hours < 24 ? out.age_hours.toFixed(1) + " 小时前" : Math.round(out.age_hours / 24) + " 天前"}取数`;
+  const need = `需重取${out.stale_groups.length ? "：" + out.stale_groups.join("、") : ""}`;
+  const run = out.run_id ? out.run_id + " " : "";
+  // 三种形状要分清：未过期（按下只复现）、过期（按下要联网）、以及换基准这一跳本身联不联网。
+  // switch 只回答「这一跳缺不缺序列」，整批联不联网由 action 说；两个条件叠起来决定自动不自动。
   box.textContent = out.benchmark.switch
-    ? `◇ 换成 ${out.benchmark.requested.name} 不联网（这批已预取它的序列）· 按下另开一个批次复现`
+    ? out.action === "replay"
+      ? `◇ 换成 ${out.benchmark.requested.name} 不联网（这批已预取它的序列）· 换过去就自动另开一个批次复现`
+      : `◇ 换成 ${out.benchmark.requested.name} 这一步不联网（序列已在盘上）· 但 ${run}${need}${age}，按下整批联网重取`
     : out.action === "replay"
-      ? `○ ${out.run_id} 未过期${age} · 报告期 ${out.as_of}，按下只复现快照`
-      : `● ${out.run_id ? out.run_id + " " : ""}需重取${out.stale_groups.length ? "：" + out.stale_groups.join("、") : ""}${age}`;
+      ? `○ ${run}未过期${age} · 报告期 ${out.as_of}，按下只复现快照`
+      : `● ${run}${need}${age}`;
   box.title = out.reason;
   $("refetch").hidden = out.action !== "replay" || !out.run_id;
 }
@@ -251,11 +263,19 @@ async function fetchValuation(force = false) {
   }, 700);
 }
 
-// 换基准不改算式里的任何一行，它改的是「这一批数据是对哪个市场测的」，所以这里只重新判断新旧，
-// 让那一行立刻变成「需重取：基准指数」或「换成它不联网」，而不是等用户按下按钮才发现没联网。
+// 换基准不改算式里的任何一行，它改的是「这一批数据是对哪个市场测的」，所以这里先重新判断新旧，
+// 让那一行立刻变成「换成它不联网」或「需重取：基准指数」，而不是等用户按下按钮才发现没联网。
+// 自动走完那一次按下的只有「这次一个网都不联」那一档：换成这批已预取过的基准、且这批其它数据还没过期，
+// 约 0.1~0.5 秒、只另开一个批次复现。要联网重取的那一档仍等按钮——一次下拉滑动不该静默起一个几十秒的作业、写一份新凭证。
+// 作业在跑时也不自动起：那时按下去只会撞上 jobs 里那句「已有一个作业在跑」，这一行照样先更新给你看。
+async function changeBenchmark() {
+  await showFreshness();
+  if (freshness && freshness.action === "replay" && freshness.benchmark.switch && !$("fetch").disabled) fetchValuation();
+}
+
 function bindFetchControls() {
   $("fetch").addEventListener("click", () => fetchValuation());
   $("refetch").addEventListener("click", () => fetchValuation(true));
-  $("benchmark").addEventListener("change", showFreshness);
+  $("benchmark").addEventListener("change", changeBenchmark);
   $("fetchbeta")?.addEventListener("input", showFreshness);
 }
