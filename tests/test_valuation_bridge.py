@@ -85,7 +85,7 @@ def test_the_arithmetic_reconciles() -> None:
         "tax_rate_ltm": 0.25,
         "da_to_revenue_ltm": 0.05,
         "capex_to_revenue_ltm": 0.05,
-        "nwc_to_revenue_delta": 0.0,
+        "nwc_to_revenue_level": 0.0,
         "interest_bearing_debt": 0.0,
         "cost_of_debt_pretax": 0.05,
         "net_borrowing": 0.0,
@@ -124,14 +124,14 @@ def test_the_bridge_stays_silent_when_the_engine_refuses_to_price() -> None:
         "revenue_base": 1000.0, "revenue_growth_path": {year: 0.0 for year in (2026, 2027)},
         "consensus_revenue": {}, "ebit_margin_path": {year: 0.30 for year in (2026, 2027)},
         "ebit_margin_ltm": 0.30, "tax_rate_ltm": 0.25, "da_to_revenue_ltm": 0.05,
-        "capex_to_revenue_ltm": 0.05, "nwc_to_revenue_delta": 0.0, "interest_bearing_debt": 0.0,
+        "capex_to_revenue_ltm": 0.05, "nwc_to_revenue_level": 0.0, "interest_bearing_debt": 0.0,
         "cost_of_debt_pretax": 0.05, "net_borrowing": 0.0, "net_debt": 0.0, "minority_interest": 0.0,
         "wacc": 0.075, "cost_of_equity": 0.075, "terminal_growth": 0.025, "mid_year_discount": False,
         "total_shares": 100.0, "price": 40.0,
     }
     for method, terminal, reason in (
         ("fcff", "uem", "ROIC"), ("fcfe", "uem", "ROIC"),
-        ("fcff", "exit_multiple", "EV/EBITDA"), ("fcfe", "exit_multiple", "市盈率"),
+        ("fcff", "exit_multiple", "EV/EBITDA"), ("fcfe", "exit_multiple", "EV/EBITDA"),
     ):
         result = evaluate(thin, method, terminal)
         bridge = valuation_bridge(result)
@@ -169,7 +169,7 @@ def test_a_ladder_row_absent_from_the_old_batch_drops_its_edge() -> None:
     inputs = {
         "revenue_base": 1000.0, "revenue_growth_path": {2026: 0.0, 2027: 0.0}, "consensus_revenue": {},
         "ebit_margin_path": {2026: 0.30, 2027: 0.30}, "ebit_margin_ltm": 0.30, "tax_rate_ltm": 0.25,
-        "da_to_revenue_ltm": 0.05, "capex_to_revenue_ltm": 0.05, "nwc_to_revenue_delta": 0.0,
+        "da_to_revenue_ltm": 0.05, "capex_to_revenue_ltm": 0.05, "nwc_to_revenue_level": 0.0,
         "interest_bearing_debt": 100.0, "cost_of_debt_pretax": 0.05, "net_borrowing": 0.0,
         "net_debt": 100.0, "minority_interest": 0.0, "wacc": 0.075, "cost_of_equity": 0.075,
         "terminal_growth": 0.025, "mid_year_discount": False, "total_shares": 100.0, "price": 40.0,
