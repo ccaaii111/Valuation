@@ -96,6 +96,33 @@ def test_window_argument_controls_the_sample() -> None:
     check("窗口参数生效", stats.observations == 52, str(stats.observations))
 
 
+def test_beta_market_leg_follows_the_erp_twin() -> None:
+    """CAPM 的市场腿与 ERP 同源：有全收益孪生就用它回归，没有才退回价格指数，并把原因写进凭证。"""
+    payload = price_payload(1.5)
+    twin = closes([r * 2.0 for r in INDEX_RETURNS[:160]])  # 个股收益 = 1.5×价格指数 = 0.75×全收益指数
+    beta, evidence = measure_beta(payload, {"twin": "H00905", "closes": twin})
+    check("有孪生时按全收益指数回归", close(beta, 0.75, 1e-6), str(beta))
+    check("凭证点名全收益腿与孪生代码", "全收益" in evidence and "H00905" in evidence, evidence)
+
+    price_beta, price_note = measure_beta(
+        payload, {"twin": None, "unavailable": "000905 在中证官网没有全收益孪生指数"}
+    )
+    check("没有孪生就退回价格指数", close(price_beta, 1.5), str(price_beta))
+    check("退回的原因写进凭证", "价格指数" in price_note and "没有全收益孪生" in price_note, price_note)
+
+
+def test_ladder_passes_the_total_return_leg_into_beta() -> None:
+    snapshot = synthetic_snapshot()
+    twin = closes([r * 2.0 for r in INDEX_RETURNS[:160]])
+    ladder = build_ladder(
+        snapshot, snapshot["consensus"], snapshot["quote"], 0.02,
+        prices=price_payload(1.5), benchmark_leg={"twin": "H00905", "closes": twin},
+    )
+    row = next(r for r in ladder.rows() if r.key == "beta")
+    check("β 行取全收益腿的回归值", close(row.baseline, 0.75, 1e-6), str(row.baseline))
+    check("β 行凭证说清用的是哪条腿", "全收益" in row.evidence, row.evidence)
+
+
 def test_only_arithmetic_failures_reject_the_measurement() -> None:
     """只有「算术上不成立」抛 BetaNotApplicable；漏传数据是 ValueError，数值不好看则照用。"""
     cases = [
