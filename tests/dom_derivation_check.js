@@ -67,11 +67,16 @@ function el(id) {
 const nodes = new Map();
 const byId = (id) => (nodes.get(id) || nodes.set(id, el(id)).get(id));
 const store = {};
+// 换基准要不要自动起作业，判据在前端：整批不联网（action=replay）而且这一跳不缺序列（switch）才自动。
+// 盘上验不出前半条——报价那一条阈值是「当日收盘」，任何一批过夜就过期，所以这里给状态接口留一个桩：
+// 装上桩就照指定的形状答复、并把 /api/fetch 的请求记下来不真起作业。盘上一个字节都不多写。
+let stub = null;
+const fetchLog = [];
 // 浮层的退路挂在 document 上（Esc），桩得把这些监听器收下来，最后真的按一次 Escape 才算验过。
 const keyHandlers = [];
 const sandbox = {
   console, URL, URLSearchParams, Object, Array, Set, Map, Number, String, Math, JSON, Boolean, isNaN, Date, RegExp, Error,
-  setTimeout, clearTimeout, Promise,
+  setTimeout, clearTimeout, setInterval, clearInterval, Promise,
   Option: function (text, value) { return { text, value: String(value) }; },
   document: {
     getElementById: byId, createElement: (tag) => el(tag), querySelector: () => el("header"),
@@ -81,7 +86,7 @@ const sandbox = {
   location: { href: `${BASE}/derivation?code=${CODE}&run=${RUN}`, search: `?code=${CODE}&run=${RUN}` },
   history: { replaceState: (_s, _t, url) => { store.url = String(url); }, state: null },
   window: { addEventListener() {}, innerWidth: 1680, innerHeight: 1050, scrollY: 0, scrollTo: (_x, y) => { win.scrollY = Number(y) || 0; store.scrollY = win.scrollY; } },
-  fetch: (url, options) => fetch(url.startsWith("http") ? url : BASE + url, options),
+  fetch: (url, options) => (stub ? stub(String(url), options) : fetch(url.startsWith("http") ? url : BASE + url, options)),
 };
 const win = sandbox.window;
 sandbox.globalThis = sandbox;
@@ -271,6 +276,8 @@ function twoHops(payload, key) {
     mentions("async function showFreshness").join(","));
   check("取数机器只写在一处：refreshOptions", mentions("async function refreshOptions").join() === "common.js",
     mentions("async function refreshOptions").join(","));
+  check("取数机器只写在一处：changeBenchmark", mentions("async function changeBenchmark").join() === "common.js",
+    mentions("async function changeBenchmark").join(","));
   check("面板接上取数台", panel.includes("configureFetchDesk(") && panel.includes("bindFetchControls()"));
   for (const id of ["benchmark", "fetch", "refetch", "freshness"]) {
     check(`推导图顶栏有 #${id}`, new RegExp(`id="${id}"`).test(page.slice(0, page.indexOf("<main>"))));
@@ -310,8 +317,13 @@ function twoHops(payload, key) {
     api.state.run = swap.run;
     byId("benchmark").value = swap.target;
     await api.showFreshness();
-    check("顶栏那一行说「换成它不联网」", byId("freshness").textContent.includes("不联网")
-      && byId("freshness").textContent.includes("另开一个批次"), byId("freshness").textContent);
+    // 那一行分两种写法，取决于这批整体联不联网：未过期才敢说「自动另开一个批次复现」，
+    // 过期时只能说「这一步不联网，但按下要整批重取」——判据本身在下面用桩验。
+    const line = byId("freshness").textContent;
+    check(swap.probe.action === "replay" ? "未过期的批次：那一行说自动另开批次复现" : "已过期的批次：那一行不承诺自动跑",
+      swap.probe.action === "replay"
+        ? line.includes("不联网") && line.includes("自动另开一个批次复现")
+        : line.includes("这一步不联网") && line.includes("需重取") && !line.includes("自动另开"), line);
   }
   // 集合外的代码仍然要联网，理由得点名缺的是指数那条腿，而不是让人去核对个股代码。
   // 哪一个批次算「集合外」不写死：盘上的批次一批比一批预取得全，这里自己去找到还缺一家的那一批。
@@ -337,6 +349,73 @@ function twoHops(payload, key) {
   }
   api.state.run = RUN;
   byId("benchmark").value = api.state.data.benchmark.code;
+
+  // 自动跑不跑这一跳，是前端把两个条件叠起来定的，盘上的批次凑不出四种形状，所以这里用桩答复逐个验：
+  // 状态接口照指定的形状回，/api/fetch 只把请求体记下来（返回失败，不真起作业、不写凭证）。
+  // 走法是真的按一次下拉：fire("change") 打到 bindFetchControls 绑的那个处理器上。
+  const runSwitch = async (case_) => {
+    fetchLog.length = 0;
+    api.state.run = case_.run;
+    byId("benchmark").value = case_.target;
+    byId("fetch").disabled = Boolean(case_.disabled);
+    stub = async (url, options) => {
+      if (url.startsWith("/api/valuation_status")) {
+        return { ok: true, json: async () => ({ code: CODE, as_of: "2026-09-30", fetched_at: "", age_hours: 1, latest: true, blocked: "", ...case_.status }) };
+      }
+      if (url.startsWith("/api/fetch")) {
+        fetchLog.push(JSON.parse(options.body));
+        return { ok: false, json: async () => ({ error: "哨兵不真起作业" }) };
+      }
+      throw new Error("换基准不该请求这个接口：" + url);
+    };
+    byId("benchmark").fire("change");
+    await sleep(40);
+    stub = null;
+    byId("fetch").disabled = false;
+    return { line: byId("freshness").textContent, posts: fetchLog.slice() };
+  };
+  const option = (code, name) => ({ code, name, total_return: false });
+  const freshStatus = {
+    run_id: "20261031-150000", action: "replay", stale: [], stale_groups: [],
+    benchmark: { requested: option("000300", "沪深300"), snapshot: option("932000", "中证2000"), prefetched: ["932000", "000300"], switch: true },
+    reason: "这批已预取 沪深300（000300）的收盘序列，换成它不联网；会另开一个批次复现，20261031-150000 原样留着",
+  };
+  const fresh = { run: "20261031-150000", target: "000300", status: freshStatus };
+  const switchCase = await runSwitch(fresh);
+  check("未过期＋集合内：自动起了一次复现", switchCase.posts.length === 1
+    && switchCase.posts[0].run === fresh.run && switchCase.posts[0].benchmark === fresh.target && !switchCase.posts[0].force,
+    JSON.stringify(switchCase.posts));
+  check("未过期＋集合内：那一行说自动另开批次复现", switchCase.line.includes("不联网") && switchCase.line.includes("自动另开一个批次复现"), switchCase.line);
+
+  const staleCase = await runSwitch({
+    ...fresh,
+    status: {
+      ...freshStatus, action: "fetch", stale_groups: ["报价"], stale: [{ group: "报价" }],
+      reason: "需要重取：报价 — 上次取数在今天收盘之前",
+    },
+  });
+  check("过期＋集合内：一次作业都不起", staleCase.posts.length === 0, JSON.stringify(staleCase.posts));
+  check("过期＋集合内：那一行既说这一步不联网，也说按下要整批重取",
+    staleCase.line.includes("这一步不联网") && staleCase.line.includes("需重取：报价") && staleCase.line.includes("按下"), staleCase.line);
+
+  const busyCase = await runSwitch({ ...fresh, disabled: true });
+  check("作业在跑时换基准不会撞第二个作业", busyCase.posts.length === 0, JSON.stringify(busyCase.posts));
+
+  const outsideCase = await runSwitch({
+    ...fresh,
+    target: "899050",
+    status: {
+      ...freshStatus, action: "fetch", stale_groups: ["基准指数"], stale: [{ group: "基准指数" }],
+      benchmark: { requested: option("899050", "上证科创板50"), snapshot: option("932000", "中证2000"), prefetched: ["932000", "000300"], switch: false },
+      reason: "需要重取：基准指数 — 这批快照的凭证里只有别的指数的收盘序列",
+    },
+  });
+  check("集合外的基准不会自动联网重取", outsideCase.posts.length === 0, JSON.stringify(outsideCase.posts));
+  check("集合外那一行报需重取：基准指数", outsideCase.line.includes("●") && outsideCase.line.includes("需重取：基准指数"), outsideCase.line);
+
+  api.state.run = RUN;
+  byId("benchmark").value = api.state.data.benchmark.code;
+  await api.showFreshness();
 
   console.log(`\n失败 ${bad} 项`);
   process.exit(bad ? 1 : 0);
