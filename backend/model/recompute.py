@@ -10,7 +10,7 @@
 2. 只重算被改动波及的下游。没被碰的分支保持基线里的数字，面板不会看见无缘由的漂移。
 3. 原料要么在行里，要么在这一行的 `raw` 里。利息费用 LTM、上年同期有息负债、五年年报营收的端点、
    LTM 的 EBIT 与净资产这些只存在于原始报表，建链那一刻被 `assumptions` 存进 `raw`（单位与行一致：亿元），
-   这条边才有权活到运行时。`risk_free` 的窗口中枢、三种永续增速情形、营运资本差分没有原料可存
+   这条边才有权活到运行时。`risk_free` 的窗口中枢、三种永续增速情形、营运资本的近五年加权水平比没有原料可存
    ——它们只在建链时算过一次，图上画虚线（见 docs/caliber.md §4.6「哪条边当场算」）。缺 `raw` 的老批次同理退回虚线，
    一个数字都不会漂。
 """
@@ -21,6 +21,7 @@ from typing import Any, Callable
 from backend.model.assumptions import (
     DERIVES,
     PRETAX_COST_OF_DEBT,
+    bounded_tax_rate,
     build_margin_path,
     build_revenue_path,
     glide_growth,
@@ -35,6 +36,9 @@ YI = 1e8
 # inputs 里的保留键：`dcf.inputs_from_ladder` 把各行的 raw 收在这里。它不是假设行，
 # 所以 `dcf.apply_overrides` 拒绝任何下划线开头的修正。
 RAW = "_raw"
+# 另一条保留键：人工逐年改过增速的那些年份，由 `dcf.apply_overrides` 记下。它不是假设行，
+# 只用来告诉营收路径「从哪一年起一致预期让位给人工增速」。
+MANUAL_GROWTH_YEARS = "_manual_growth_years"
 
 
 def _number(value: Any) -> float | None:
@@ -100,7 +104,9 @@ def derive_revenue_path(inputs: dict) -> dict[str, float] | None:
     base = _number(inputs.get("revenue_base"))
     if not growth or base is None:
         return None
-    path = build_revenue_path(growth, row_years(inputs.get("consensus_revenue")), base)
+    path = build_revenue_path(
+        growth, row_years(inputs.get("consensus_revenue")), base, inputs.get(MANUAL_GROWTH_YEARS)
+    )
     return rekey_years({year: round(value, 4) for year, value in path.items()}, inputs.get("revenue_path"))
 
 
@@ -257,9 +263,7 @@ def derive_roic_ltm(inputs: dict) -> float | None:
     ebit = _number(raw.get("ebit_ltm")) if raw else None
     if ebit is None:
         return None
-    tax = _number(inputs.get("tax_rate_ltm"))
-    if tax is None:
-        tax = _number(inputs.get("tax_rate_hist")) or 0.0
+    tax = bounded_tax_rate(_number(inputs.get("tax_rate_ltm")), _number(inputs.get("tax_rate_hist")))[0]
     invested = (
         (_number(raw.get("total_equity")) or 0.0)
         + (_number(inputs.get("interest_bearing_debt")) or 0.0)
