@@ -49,7 +49,7 @@ def base_inputs(**overrides) -> dict:
         "tax_rate_ltm": 0.25,
         "da_to_revenue_ltm": 0.05,
         "capex_to_revenue_ltm": 0.05,
-        "nwc_to_revenue_delta": 0.0,
+        "nwc_to_revenue_level": 0.0,
         "interest_bearing_debt": 0.0,
         "cost_of_debt_pretax": 0.05,
         "net_borrowing": 0.0,
@@ -125,14 +125,20 @@ def test_discount_axis_follows_the_window() -> None:
 
 
 def test_window_only_shortens_the_first_year_never_the_growth_base() -> None:
-    """ΔNWC 的上年基数必须是整年营收：首年被缩过就等于凭空给第二年造出一段增长。"""
-    inputs = base_inputs(report_as_of="2026-06-30", nwc_to_revenue_delta=0.2,
+    """比率法：首年那一段增量用整年营收算出来，再整体按窗口折算；第二年接的是整年营收，不接被缩过的那一半。"""
+    inputs = base_inputs(report_as_of="2026-06-30", nwc_to_revenue_level=0.2,
                          revenue_growth_path={2026: 0.10, **{y: 0.0 for y in YEARS[1:]}})
     result = evaluate(inputs, "fcff", "gordon")
     check("首年整年营收 1100 → 窗口内 550", close(result.lines[0].revenue, 550.0), f"{result.lines[0].revenue}")
     check("第二年营收 1100（增速为 0）", close(result.lines[1].revenue, 1100.0), f"{result.lines[1].revenue}")
     check("第二年 ΔNWC = 0（不因为首年缩过而虚增）", close(result.lines[1].nwc_change, 0.0), f"{result.lines[1].nwc_change}")
-    check("首年 ΔNWC = 0.2 × 100 × 0.5", close(result.lines[0].nwc_change, 10.0), f"{result.lines[0].nwc_change}")
+    check("首年 ΔNWC = 0.2 × (1100 − 1000) 再乘窗口 0.5",
+          close(result.lines[0].nwc_change, 10.0), f"{result.lines[0].nwc_change}")
+    # 增量站在整年营收轴上，缩的是金额不是那段增长；首年之后增速为零，占款就为零。
+    growing = evaluate(base_inputs(report_as_of="2026-06-30", nwc_to_revenue_level=0.2,
+                                   revenue_growth_path={y: 0.10 for y in YEARS}), "fcff", "gordon")
+    check("往后各年增量按整年营收差", close(growing.lines[1].nwc_change, 0.2 * (1210.0 - 1100.0), 1e-9),
+          f"{growing.lines[1].nwc_change}")
 
 
 def test_ladder_passes_the_report_date_through() -> None:
