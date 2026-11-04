@@ -134,7 +134,7 @@ def test_panel_lets_the_backend_decide_whether_to_go_online() -> None:
     for name in ("panel.html", "derivation.html"):
         check(f"{name} 的按钮说明交代了名录准入", "名录里没有的代码直接拒" in (STATIC_DIR / name).read_text(encoding="utf-8"))
     # 抽成公共件之后，页面再自带一份就是分叉的开始：两份 fetchValuation 会各存一种「换基准联不联网」的说法。
-    for name in ("fetchValuation", "showFreshness", "refreshOptions"):
+    for name in ("fetchValuation", "showFreshness", "refreshOptions", "changeBenchmark"):
         check(f"页面不重复声明 {name}", f"function {name}" not in page)
 
 
@@ -144,7 +144,12 @@ def test_both_pages_run_the_same_fetch_desk() -> None:
     pages = {name: (STATIC_DIR / name).read_text(encoding="utf-8") for name in ("panel.html", "derivation.html")}
     check("取数台认得这批预取过谁", "out.benchmark.switch" in common and "另开一个批次复现" in common,
           common[common.find("async function showFreshness"):][:600])
-    check("预取过的基准不必联网这句写在公共件里", "换成下拉里的另一个基准不联网" in common)
+    check("预取过的基准不必联网这句写在公共件里", "换成下拉里的另一个基准这一步不联网" in common)
+    # 自动跑只有「这次一个网都不联」那一档：整批未过期（action=replay）且这一跳不缺序列（switch）才起作业，
+    # 两个值都读后端，页面不另算一遍判据——判据分叉就是「过期时静默起一个几十秒作业」的开始。
+    check("换基准的自动通路只认不联网那一档",
+          'freshness.action === "replay" && freshness.benchmark.switch' in common
+          and '$("benchmark").addEventListener("change", changeBenchmark)' in common)
     for name, text in pages.items():
         check(f"{name} 有基准下拉与取数按钮", 'id="benchmark"' in text and 'id="fetch"' in text)
         check(f"{name} 把取数台接上自己的 reload", "configureFetchDesk(" in text and "bindFetchControls()" in text)
