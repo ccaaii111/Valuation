@@ -30,6 +30,7 @@ from fixtures import synthetic_ladder  # noqa: E402
 from backend.model.recompute import (  # noqa: E402
     NEEDS_RAW,
     DERIVE,
+    MANUAL_GROWTH_YEARS,
     _ORDER,
     _depth,
     downstream_of,
@@ -106,6 +107,51 @@ def test_manual_rows_are_constants() -> None:
     check("g 行也算人工改动", row_of(report, "terminal_growth")["changed"])
     check("营收绝对额行是被动的那一个", row_of(report, "revenue_path")["recomputed"] is True
           and row_of(report, "revenue_path")["changed"] is False)
+
+
+def test_manual_growth_takes_the_revenue_over_from_the_earliest_named_year() -> None:
+    """一致预期是机器基线，可人工点了增速就得让人工说了算：从最早点名那一年起（含）锚点不再钉住营收。
+
+    只放开被点名的那一年不够——次年机构数又把它按回预期值，增速改到多大都只动一年的现金流。
+    """
+    check("基线里锚点年营收取一致预期", INPUTS["revenue_path"]["2026"] == INPUTS["consensus_revenue"]["2026"],
+          f"{INPUTS['revenue_path']['2026']} vs {INPUTS['consensus_revenue']['2026']}")
+    check("没点增速时不留人工年份键", MANUAL_GROWTH_YEARS not in apply_overrides(INPUTS, {"market_cap": 6000.0}))
+    check("没点增速时营收路径逐格停在基线",
+          apply_overrides(INPUTS, {"market_cap": 6000.0})["revenue_path"] == INPUTS["revenue_path"])
+
+    lifted = apply_overrides(INPUTS, {GROWTH: {"2026": 0.5}})
+    check("点名的年份记在内部键上", lifted[MANUAL_GROWTH_YEARS] == [2026], str(lifted[MANUAL_GROWTH_YEARS]))
+    check("点名那年营收改按增速往上乘", abs(lifted["revenue_path"]["2026"] - INPUTS["revenue_base"] * 1.5) < 5e-4,
+          str(lifted["revenue_path"]["2026"]))
+    check("次年一致预期不再把营收按回预期值", lifted["revenue_path"]["2027"] != INPUTS["revenue_path"]["2027"],
+          f"{lifted['revenue_path']['2027']} vs 基线 {INPUTS['revenue_path']['2027']}")
+    check("往后每一年都脱离锚点", all(lifted["revenue_path"][y] != INPUTS["revenue_path"][y] for y in ("2028", "2030", "2035")),
+          str({y: lifted["revenue_path"][y] for y in ("2028", "2030", "2035")}))
+    check("每股跟着人工增速走", evaluate(lifted).per_share != evaluate(INPUTS).per_share,
+          f"{round(evaluate(lifted).per_share, 4)} vs {round(evaluate(INPUTS).per_share, 4)}")
+
+    report = attribute(LADDER, {GROWTH: {"2026": 0.5}})
+    check("一致预期那几行的数还摆在链上", row_of(report, "consensus_revenue")["baseline"]["2026"] == INPUTS["consensus_revenue"]["2026"])
+    check("没被点名的锚点行不算改动", row_of(report, "consensus_revenue")["changed"] is False)
+    check("营收绝对额行带出脱离锚点后的新数", row_of(report, "revenue_path")["current"]["2027"] == lifted["revenue_path"]["2027"],
+          str(row_of(report, "revenue_path")["current"]["2027"]))
+
+    later = apply_overrides(INPUTS, {GROWTH: {"2029": 0.5}})
+    check("只点名锚点之后的年份时锚点年仍取一致预期",
+          later["revenue_path"]["2026"] == INPUTS["revenue_path"]["2026"]
+          and later["revenue_path"]["2027"] == INPUTS["revenue_path"]["2027"],
+          f"{later['revenue_path']['2026']} / {later['revenue_path']['2027']}")
+    check("点名那一年确实改按增速往上乘", abs(later["revenue_path"]["2029"] - later["revenue_path"]["2028"] * 1.5) < 1e-3,
+          f"{later['revenue_path']['2029']} vs {later['revenue_path']['2028']}")
+    both = apply_overrides(INPUTS, {GROWTH: {"2027": 0.5, "2029": 0.5}})
+    first_only = apply_overrides(INPUTS, {GROWTH: {"2027": 0.5}})
+    check("点名的年份都留着、按年份排好", both[MANUAL_GROWTH_YEARS] == [2027, 2029], str(both[MANUAL_GROWTH_YEARS]))
+    check("多点名几年时以最早那一年起接管，更早的锚点年不受后面那一年影响",
+          all(both["revenue_path"][y] == first_only["revenue_path"][y] for y in ("2026", "2027", "2028"))
+          and both["revenue_path"]["2026"] == INPUTS["revenue_path"]["2026"]
+          and both["revenue_path"]["2027"] != INPUTS["revenue_path"]["2027"],
+          f"{both['revenue_path']['2026']} / {both['revenue_path']['2027']}")
 
 
 def test_capital_rows_move_without_touching_the_revenue_branch() -> None:
@@ -222,8 +268,13 @@ def test_registry_declares_every_edge_it_can_honour() -> None:
         missing = [p for p in parents if p not in INPUTS]
         check(f"{key} 的每个上游都是链上的行", not missing, str(missing))
     display_only = {"revenue_path", "revenue_cagr_5y", "ebit_margin_start", "horizon_years"}
-    check("重导行要么进引擎，要么是只喂链上别的行的中间行", set(DERIVE) <= ENGINE_INPUTS | display_only,
-          str(sorted(set(DERIVE) - ENGINE_INPUTS - display_only)))
+    # pe_ttm 是第三种：不进定价，也不喂链上任何行，但它由市值与归母净利两行导出——改那两行时它得跟着重算，
+    # 否则参考行会停在旧市值上，面板上那两个数就对不上同一时刻。
+    reference_only = {"pe_ttm"}
+    check("重导行要么进引擎，要么是只喂链上别的行的中间行，要么是跟着上游动的参考行",
+          set(DERIVE) <= ENGINE_INPUTS | display_only | reference_only,
+          str(sorted(set(DERIVE) - ENGINE_INPUTS - display_only - reference_only)))
+    check("pe_ttm 不进引擎输入：退出倍数两臂都吃 EV/EBITDA", "pe_ttm" not in ENGINE_INPUTS)
     check("revenue_path 只是给人看的显示行，不进引擎输入", "revenue_path" not in ENGINE_INPUTS)
     check("显性年数也只是计数：不进引擎输入，改了它不动结果", "horizon_years" not in ENGINE_INPUTS)
     for key in ("revenue_cagr_5y", "ebit_margin_start"):
@@ -250,13 +301,13 @@ def _depth_ok(key: str) -> bool:
 
 
 def test_build_time_edges_stay_out_of_the_runtime_machine() -> None:
-    """这些边的原料连 raw 都存不下（一组窗口、三种情形、一条差分），只许虚着。
+    """这些边的原料连 raw 都存不下（一组窗口、三种情形、近五年逐年水平比），只许虚着。
 
     `horizon_years` 从前也在这张名单里（年数是锚点覆盖广度的副产品，行里读不出来）；显性期改成输入之后
     它就是增速行覆盖的年份数，原料全在链上，画成虚线反而是骗人的线——所以它搬进了 DERIVE。
     """
     build_only = ["risk_free", "revenue_ltm", "terminal_growth", "terminal_growth_central", "terminal_growth_optimistic",
-                  "nwc_to_revenue_delta", "anchor_source", "consensus_dispersion"]
+                  "nwc_to_revenue_level", "anchor_source", "consensus_dispersion"]
     for key in build_only:
         check(f"{key} 不在可重导集合里", key not in DERIVE)
     check("显性年数跟着增速行走", "horizon_years" in DERIVE)
