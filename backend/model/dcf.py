@@ -10,7 +10,7 @@ from datetime import date
 from typing import Any, Iterable
 
 from backend.model import recompute
-from backend.model.assumptions import build_revenue_path, derive_rates, implied_ev_ebitda
+from backend.model.assumptions import bounded_tax_rate, build_revenue_path, derive_rates, implied_ev_ebitda
 
 TV_SHARE_WARNING = 0.75
 # r−g 薄到一定程度时，Gordon 的 1/(r−g) 就成了主角：1.68pp 的价差等于把最后一期现金流放大 59 倍。
@@ -21,6 +21,8 @@ THIN_SPREAD_WARNING = 0.03
 # `horizon_target` gets there one hop away — recompute re-cuts the year set of revenue_growth_path from it.
 # A test asserts every one of them exists in a generated baseline, which catches ladder/engine name drift.
 # cost_of_equity and wacc are deliberately absent: they are outputs of the rate cascade, not knobs.
+# `pe_ttm` and `exit_pe` are deliberately absent too: both arms' exit-multiple terminal value is priced on
+# EV/EBITDA now, so the two equity multiples are market-basis reference rows and no engine path reads them.
 ENGINE_INPUTS = frozenset(
     {
         "revenue_base",
@@ -35,11 +37,12 @@ ENGINE_INPUTS = frozenset(
         "da_to_revenue_ltm",
         "capex_to_revenue_ltm",
         "capex_to_revenue_hist",
-        "nwc_to_revenue_delta",
+        "nwc_to_revenue_level",
         "interest_bearing_debt",
         "net_debt",
         "net_borrowing",
         "lease_financing",
+        "minority_profit_ltm",
         "minority_interest",
         "risk_free",
         "beta",
@@ -47,9 +50,7 @@ ENGINE_INPUTS = frozenset(
         "equity_weight",
         "cost_of_debt_pretax",
         "terminal_growth",
-        "exit_pe",
         "exit_ev_ebitda",
-        "pe_ttm",
         "roic_ltm",
         "mid_year_discount",
         "total_shares",
@@ -80,6 +81,7 @@ class YearLine:
     nopat: float
     interest: float
     net_income: float
+    minority: float
     da: float
     capex: float
     nwc_change: float
@@ -201,6 +203,14 @@ def apply_overrides(inputs: dict, overrides: dict) -> dict:
             out[key] = {**seed, **{by_text[str(k)]: v for k, v in value.items()}}
         else:
             out[key] = value
+    # 人工点名的增速年份要一路带到营收那一步：从最早那一年起一致预期不再钉住营收（见 build_revenue_path）。
+    # 先清掉再写，同一份 inputs 连着改两次时上一次的年份不该留下。
+    out.pop(recompute.MANUAL_GROWTH_YEARS, None)
+    named = overrides.get("revenue_growth_path")
+    if isinstance(named, dict):
+        years = sorted({int(year) for year in named})
+        if years:
+            out[recompute.MANUAL_GROWTH_YEARS] = years
     return recompute.recompute_derived(out, set(overrides))
 
 
@@ -219,10 +229,7 @@ def _num(value: Any) -> float | None:
 
 
 def _tax_rate(inputs: dict) -> float:
-    tax = _num(inputs.get("tax_rate_ltm"))
-    if tax is not None:
-        return tax
-    return _num(inputs.get("tax_rate_hist")) or 0.25
+    return bounded_tax_rate(_num(inputs.get("tax_rate_ltm")), _num(inputs.get("tax_rate_hist")))[0]
 
 
 def discount_rates(inputs: dict) -> tuple[float | None, float | None]:
@@ -291,6 +298,27 @@ def stub_fraction(as_of: date | None, first_year: int) -> float:
     return months / 12.0 if months else 1.0
 
 
+def _fcfe_terminal_bridge(
+    enterprise_terminal: float, inputs: dict, net_financing: float, stub: float, years: int
+) -> tuple[float, dict[str, float]]:
+    """企业口径终值 → 股权口径：减去终止年那一刻还欠着的净债务与少数股东权益。
+
+    存量取终止年而不是报表日：显性期里每年那笔净融资已经作为股东的现金流入发进 FCFE 了，
+    它在账上欠着的部分必须在这里减回去，否则借款的好处白拿。少数股东没有可累加的变化量
+    （模型里只有报表余额），所以它沿用余额，与 FCFF 那条桥同一个近似。
+    """
+    debt_reported = _num(inputs.get("net_debt")) or 0.0
+    minority_terminal = _num(inputs.get("minority_interest")) or 0.0
+    debt_addition = net_financing * (stub + years - 1)
+    debt_terminal = debt_reported + debt_addition
+    return enterprise_terminal - debt_terminal - minority_terminal, {
+        "debt_reported": debt_reported,
+        "debt_addition": debt_addition,
+        "debt_terminal": debt_terminal,
+        "minority_terminal": minority_terminal,
+    }
+
+
 def evaluate(
     inputs: dict,
     method: str = "fcff",
@@ -312,16 +340,24 @@ def evaluate(
 
     anchors = {int(k): v for k, v in _year_map(inputs.get("consensus_revenue")).items()}
     base = _num(inputs.get("revenue_base"))
-    revenue_series = build_revenue_path(growth, anchors, base)
+    manual_years = [int(year) for year in inputs.get(recompute.MANUAL_GROWTH_YEARS) or ()]
+    revenue_series = build_revenue_path(growth, anchors, base, manual_years)
     years = sorted(growth)
     revenue = {year: revenue_series.get(year) for year in years}
     if any(revenue.get(year) is None for year in years):
         return DcfResult(method, terminal, None, bool(mid_year), warnings=["营收路径不完整（缺最后年报营收或锚点）"])
 
-    tax = _num(inputs.get("tax_rate_ltm"))
-    if tax is None:
-        tax = _tax_rate(inputs)
-        warnings.append(f"有效税率缺失，回退 {tax:.1%}")
+    # 人工增速接管掉的那几个锚点年要说出来：那一行的机构数还摆在链上，但它已经不进定价了。
+    bypassed = sorted(year for year in anchors if manual_years and year >= min(manual_years))
+    if bypassed:
+        warnings.append(
+            f"营收增速被人工改过：{bypassed[0]} 年起（含）的一致预期锚点不再钉住营收，"
+            f"那几年的营收改按增速往上乘（一致预期那几行的数仍在链上，只是不进定价）"
+        )
+
+    tax, tax_fallback = bounded_tax_rate(_num(inputs.get("tax_rate_ltm")), _num(inputs.get("tax_rate_hist")))
+    if tax_fallback:
+        warnings.append(tax_fallback)
 
     # The discount rate is recomputed from rf/β/ERP/权益权重/债务成本/税率 on every run, so a manual
     # edit anywhere in that chain moves the rate the whole valuation prices with. The stored rows only
@@ -333,16 +369,53 @@ def evaluate(
         return DcfResult(method, terminal, None, bool(mid_year), warnings=[f"{method.upper()} 缺折现率，无法计算"])
     if mid_year is None:
         mid_year = bool(inputs.get("mid_year_discount", False))
-    da_ratio = _num(inputs.get("da_to_revenue_ltm")) or 0.0
+    da_ratio = _num(inputs.get("da_to_revenue_ltm"))
+    if da_ratio is None:
+        warnings.append("折旧摊销占营收缺失，D&A 按 0 计")
+        da_ratio = 0.0
     capex_ratio = _num(inputs.get("capex_to_revenue_ltm"))
     if capex_ratio is None:
-        capex_ratio = _num(inputs.get("capex_to_revenue_hist")) or 0.0
-    nwc_ratio = _num(inputs.get("nwc_to_revenue_delta")) or 0.0
-    cost_of_debt = _num(inputs.get("cost_of_debt_pretax")) or 0.0
+        capex_ratio = _num(inputs.get("capex_to_revenue_hist"))
+        if capex_ratio is None:
+            warnings.append("资本开支占营收缺失，CapEx 按 0 计")
+            capex_ratio = 0.0
+        else:
+            warnings.append(f"资本开支 LTM 缺失，退回历史均值 {capex_ratio:.1%}")
+    nwc_ratio = _num(inputs.get("nwc_to_revenue_level"))
+    if nwc_ratio is None:
+        warnings.append("营运资本占营收比率缺失，ΔNWC 按 0 计")
+    cost_of_debt = _num(inputs.get("cost_of_debt_pretax"))
+    if cost_of_debt is None:
+        warnings.append("税前债务成本缺失，利息与 WACC 的债务腿按 0 计")
+        cost_of_debt = 0.0
     # Financial debt from the cash-flow statement plus lease liabilities from the balance sheet: both are
     # debt-financed inflows the equity holder receives, and neither is an interest cost yet.
-    net_financing = (_num(inputs.get("net_borrowing")) or 0.0) + (_num(inputs.get("lease_financing")) or 0.0)
-    interest_base = _num(inputs.get("interest_bearing_debt")) or 0.0
+    borrowing = _num(inputs.get("net_borrowing"))
+    if borrowing is None:
+        if method == "fcfe":
+            warnings.append("净债务融资缺失，FCFE 按 0 计")
+        borrowing = 0.0
+    # 租赁融资缺失就是「没有租赁融资」：没列租赁负债的公司这一格本来就是空的，不再另发警告。
+    lease_financing = _num(inputs.get("lease_financing")) or 0.0
+    net_financing = borrowing + lease_financing
+    interest_base = _num(inputs.get("interest_bearing_debt"))
+    if interest_base is None:
+        warnings.append("有息负债缺失，利息按 0 计")
+        interest_base = 0.0
+    # FCFE 从合并 EBIT 出发，税后净利里还含着少数股东那一份；按 LTM 占营收比逐年扣掉，
+    # 让这条口径落回归属母公司的现金流。FCFF 折的是全投资人的钱，不用扣。
+    minority_profit_ltm = _num(inputs.get("minority_profit_ltm"))
+    if minority_profit_ltm is None:
+        if method == "fcfe":
+            warnings.append("少数股东损益 LTM 缺失，FCFE 未扣少数股东份额")
+        minority_profit_ltm = 0.0
+    revenue_ltm = _num(inputs.get("revenue_ltm"))
+    if minority_profit_ltm and not revenue_ltm:
+        if method == "fcfe":
+            warnings.append("少数股东损益 LTM 有值但缺 LTM 营收，无法按营收比摊到各年")
+        minority_ratio = 0.0
+    else:
+        minority_ratio = minority_profit_ltm / revenue_ltm if revenue_ltm else 0.0
 
     margins = _forward_filled(years, _year_map(inputs.get("ebit_margin_path")), _num(inputs.get("ebit_margin_ltm")))
     if all(v == 0 for v in margins.values()):
@@ -378,19 +451,27 @@ def evaluate(
         nopat = ebit * (1.0 - tax)
         da = rev * da_ratio
         capex = rev * capex_ratio
-        nwc_change = nwc_ratio * (rev - prior_revenue)
+        # 比率（逐年余额 ÷ 营收，近大远小加权）作用在营收增量上。
+        # 首年的上一年是最后年报那一年的整年营收，所以首年被残期缩过时不会凭空多出一段增量。
+        if nwc_ratio is None:
+            nwc_change = 0.0
+        else:
+            nwc_change = nwc_ratio * (rev - prior_revenue)
         prior_revenue = rev
         fcff = nopat + da - capex - nwc_change
-        interest = interest_base * cost_of_debt
+        # 债务跟着每年那笔净融资增长，利息就按当年的债务余额算；只加债务不算利息会让 FCFE 逐年虚高。
+        debt = interest_base + net_financing * (stub + index)
+        interest = debt * cost_of_debt
         net_income = (ebit - interest) * (1.0 - tax)
-        fcfe = net_income + da - capex - nwc_change + net_financing
+        minority = rev * minority_ratio
+        fcfe = net_income - minority + da - capex - nwc_change + net_financing
         window = stub if index == 0 else 1.0
         t = stub + index - (window / 2.0 if mid_year else 0.0)
         factor = 1.0 / (1.0 + rate) ** t
         lines.append(
             YearLine(year, t, rev * window, margins[year], ebit * window, nopat * window, interest * window,
-                     net_income * window, da * window, capex * window, nwc_change * window, fcff * window,
-                     fcfe * window, factor, fcff * window * factor, fcfe * window * factor, window)
+                     net_income * window, minority * window, da * window, capex * window, nwc_change * window,
+                     fcff * window, fcfe * window, factor, fcff * window * factor, fcfe * window * factor, window)
         )
 
     pv_explicit = sum(line.pv_fcff if method == "fcff" else line.pv_fcfe for line in lines)
@@ -400,7 +481,10 @@ def evaluate(
     terminal_value: float | None
     terminal_params: dict[str, Any] = {}
     if terminal == "gordon":
-        flow = (last.fcff if method == "fcff" else last.fcfe) * (1.0 + terminal_growth)
+        # FCFE 的永续年金只放经营现金流：把每年同一笔净融资也资本化，等于假设债务永远按这个速度增长。
+        # 少数股东损益已经在逐年的 FCFE 里扣掉，年末那一笔也带着它。
+        flow = last.fcff if method == "fcff" else last.fcfe - net_financing
+        flow *= 1.0 + terminal_growth
         terminal_value = flow / (rate - terminal_growth)
     elif terminal == "uem":
         roic = _num(inputs.get("roic_ltm"))
@@ -409,30 +493,44 @@ def evaluate(
         # 负增长不需要再投资：g/ROIC 为负会把 (1−再投资率) 抬到 1 以上，等于向收缩中的公司收增长红利。
         reinvestment = max(0.0, min(1.0, terminal_growth / roic))
         nopat_next = last.nopat * (1.0 + terminal_growth)
+        # UEM 的分子是 NOPAT，终值本身是企业口径；FCFE 折的是股东的钱，所以和退出倍数那一格一样，
+        # 要在终止年过桥把还欠着的债务与少数股东那份扣掉。
         terminal_value = nopat_next * (1.0 - reinvestment) / (rate - terminal_growth)
         terminal_params = {"roic": roic, "reinvestment": reinvestment}
+        if method == "fcfe":
+            terminal_value, bridge = _fcfe_terminal_bridge(
+                terminal_value, inputs, net_financing, stub, len(lines)
+            )
+            terminal_params |= bridge
         warnings.append(f"UEM 再投资率 {reinvestment:.1%}（= g / ROIC）")
     else:  # exit_multiple
-        if method == "fcff":
-            multiple = _num(inputs.get("exit_ev_ebitda"))
-            if multiple is None:
-                multiple = _implied_ev_ebitda(inputs)
+        # 两臂用同一把尺子：EV/EBITDA。区别只在桥——FCFF 折出来的是企业价值，末年那一笔就是 EV 本身；
+        # FCFE 折的是股东的钱，所以终值要先在终止年那一刻过桥，把还欠着的债务与少数股东那份扣掉。
+        multiple = _num(inputs.get("exit_ev_ebitda"))
+        if multiple is None:
+            multiple = _implied_ev_ebitda(inputs)
+            if method == "fcff":
                 warnings.append(f"退出倍数取当前隐含 EV/EBITDA {multiple:.2f}x" if multiple else "无 EV/EBITDA 可用")
-            if not multiple:
-                return DcfResult(method, terminal, rate, mid_year, lines, warnings=["退出倍数法缺 EV/EBITDA"])
-            terminal_value = (last.ebit + last.da) * multiple
-            terminal_params = {"exit_multiple": multiple, "multiple_row": "exit_ev_ebitda"}
+        # 倍数与 EBITDA 都要为正：负倍数配负 EBITDA 会折出一个正终值，两个负号相折这种形状一律拦掉。
+        if not multiple or multiple <= 0:
+            return DcfResult(method, terminal, rate, mid_year, lines, warnings=["退出 EV/EBITDA 不可得（倍数缺失或非正）"])
+        ebitda_terminal = last.ebit + last.da
+        if ebitda_terminal <= 0:
+            return DcfResult(
+                method, terminal, rate, mid_year, lines, warnings=["退出 EV/EBITDA 不可得（末年 EBITDA 非正）"]
+            )
+        enterprise_terminal = ebitda_terminal * multiple
+        terminal_params = {
+            "exit_multiple": multiple,
+            "ebitda_terminal": ebitda_terminal,
+        }
+        if method == "fcff":
+            terminal_value = enterprise_terminal
         else:
-            pe = _year_map(inputs.get("exit_pe"))
-            multiple = pe.get(last.year) or (_num(inputs.get("pe_ttm")))
-            # 只拦 None 和 0 不够：亏损公司通道原值是负倍数，负号 × 负净利会折出一个正终值。
-            if not multiple or multiple <= 0:
-                return DcfResult(method, terminal, rate, mid_year, lines, warnings=["退出市盈率不可得（缺失或非正）"])
-            terminal_value = last.net_income * multiple
-            terminal_params = {
-                "exit_multiple": multiple,
-                "multiple_row": "exit_pe" if pe.get(last.year) else "pe_ttm",
-            }
+            terminal_value, bridge = _fcfe_terminal_bridge(
+                enterprise_terminal, inputs, net_financing, stub, len(lines)
+            )
+            terminal_params |= bridge
 
     pv_terminal = terminal_value / (1.0 + rate) ** t_terminal
     total = pv_explicit + pv_terminal
@@ -502,6 +600,8 @@ def evaluate(
             "report_as_of": inputs.get("report_as_of"),
             "net_debt": _num(inputs.get("net_debt")) or 0.0,
             "minority": _num(inputs.get("minority_interest")) or 0.0,
+            "minority_profit_ltm": minority_profit_ltm,
+            "minority_ratio": minority_ratio,
             "shares": shares,
             "price": price,
             **terminal_params,
@@ -540,8 +640,9 @@ def matrix(inputs: dict, mid_year: bool | None = None, rate: float | None = None
 def cross_check(inputs: dict, tolerance: float = 0.05, rate: float | None = None, mid_year: bool | None = None) -> list[str]:
     """FCFF and FCFE must price the SAME operating cash flows; only the financing bridge may differ.
 
-    equity(FCFF) = PV(FCFF flows) + bridge, bridge = -net_debt - minority, and equity(FCFE) = PV(FCFE flows).
-    So the flow difference, not the per-share difference, is the real consistency test. It is checked both
+    equity(FCFF) = PV(FCFF flows) - net_debt - minority_equity; FCFE prices parent flows, so its
+    explicit FCFE is already net of interest, net financing and minority profit. So the flow
+    difference, not the per-share difference, is the real consistency test. It is checked both
     undiscounted (a cash-flow definition problem: interest / net_borrowing) and discounted (a rate problem:
     WACC and cost of equity that no longer describe one capital structure).
 
@@ -567,14 +668,18 @@ def cross_check(inputs: dict, tolerance: float = 0.05, rate: float | None = None
 
     if abs(raw_gap) > tolerance:
         # 取末年而不是首年：首年被残期缩过，只有每一整年的利息额能代表「每年」那句话。
-        after_tax_interest = fcff.lines[-1].interest * (1 - (_num(inputs.get("tax_rate_ltm")) or 0.0))
+        after_tax_interest = fcff.lines[-1].interest * (1 - _tax_rate(inputs))
         borrowing = _num(inputs.get("net_borrowing")) or 0.0
         lease = _num(inputs.get("lease_financing")) or 0.0
-        financing = f"净借款 {_fmt(borrowing)} + 租赁净融资 {_fmt(lease)} 亿元"
+        financing = f"净债务融资 {_fmt(borrowing)} + 租赁净融资 {_fmt(lease)} 亿元"
+        minority = _num(inputs.get("minority_profit_ltm")) or 0.0
+        minority_clause = f"少数股东损益 {_fmt(minority)} 亿元也逐年从 FCFE 扣掉，" if minority else ""
         notes.append(
-            f"两条口径名义现金流背离 {raw_gap:+.1%}（超过 {tolerance:.0%}）：每年 {financing} 被 FCFE 计为流入，每年税后利息 "
-            f"{_fmt(after_tax_interest)} 亿元只在 FCFE 扣除。"
-            "若终值期不再新增借款，此背离即为 FCFE 高估，应以 FCFF 为准"
+            f"两条口径名义现金流背离 {raw_gap:+.1%}（超过 {tolerance:.0%}）：每年 {financing} 被 FCFE 计为流入，"
+            f"利息按当年债务余额计、末年税后利息 {_fmt(after_tax_interest)} 亿元只在 FCFE 扣除，"
+            + minority_clause
+            + "退出倍数与 UEM 两格已在终止年桥上把这笔累计净债务减回去，Gordon 的终值只用不含净融资的经营 FCFE；"
+            "剩下的背离来自显性期的融资、利息与少数股东损益，属资本结构假设本身，不是取数错误"
         )
     elif abs(pv_gap) > tolerance:
         cascade_equity, cascade_wacc = derive_rates(
@@ -606,7 +711,8 @@ def cross_check(inputs: dict, tolerance: float = 0.05, rate: float | None = None
             )
     else:
         notes.append(
-            f"两条口径自洽（名义 {raw_gap:+.2%} / 现值 {pv_gap:+.2%}），每股差值即桥接项 {_fmt(bridge_ps)} 元"
+            f"两条口径自洽（名义 {raw_gap:+.2%} / 现值 {pv_gap:+.2%}），桥接项 {_fmt(bridge_ps)} 元；"
+            "每股差值＝桥接项＋两条口径现值的差额"
         )
     if fcff.per_share and fcfe.per_share:
         notes.append(f"每股 FCFF {fcff.per_share:.2f} vs FCFE {fcfe.per_share:.2f}")
@@ -682,9 +788,16 @@ def valuation_bridge(result: DcfResult, known: Iterable[str] | None = None) -> d
     add("step_capex", "资本支出合计", total("capex"), "亿元",
         f"CapEx_t = 营收_t × 资本支出率 {params.get('capex_ratio', 0.0):.2%}",
         ["step_revenue", "capex_to_revenue_ltm", "capex_to_revenue_hist"], yearly("capex"))
+    nwc_ratio = params.get("nwc_ratio")
+    nwc_change_note = (
+        f"ΔNWC_t = 营运资本/营收比率 {nwc_ratio:.2%} × (营收_t − 营收_(t−1))；"
+        "首年的上一年取最后年报那一年的整年营收，首年被残期缩时增量不缩"
+        if nwc_ratio is not None
+        else "ΔNWC_t = 0：营运资本占营收比率缺失"
+    )
     add("step_nwc", "营运资本增加合计", total("nwc_change"), "亿元",
-        f"ΔNWC_t = 营运资本率 {params.get('nwc_ratio', 0.0):.2%} × (营收_t − 营收_(t−1))；首年接最后年报营收",
-        ["step_revenue", "nwc_to_revenue_delta"], yearly("nwc_change"))
+        nwc_change_note,
+        ["step_revenue", "nwc_to_revenue_level"], yearly("nwc_change"))
 
     if is_fcff:
         add(f"step_{flow.lower()}", f"{flow} 合计", total("fcff"), "亿元",
@@ -692,19 +805,26 @@ def valuation_bridge(result: DcfResult, known: Iterable[str] | None = None) -> d
             ["step_nopat", "step_da", "step_capex", "step_nwc"], yearly("fcff"))
     else:
         add("step_interest", "利息（税前）合计", total("interest"), "亿元",
-            f"利息 = 有息负债 {params.get('interest_base', 0.0):,.2f} 亿 × 税前债务成本 "
-            f"{params.get('cost_of_debt', 0.0):.2%}，显性期每年同额{stub_note}",
-            ["interest_bearing_debt", "cost_of_debt_pretax"], yearly("interest"))
+            f"利息_t = 当年债务余额 × 税前债务成本 {params.get('cost_of_debt', 0.0):.2%}；"
+            f"余额从报表有息负债 {params.get('interest_base', 0.0):,.2f} 亿起，每年加一笔净融资"
+            + ("（首年按残期折算）" if stub < 1.0 else ""),
+            ["interest_bearing_debt", "cost_of_debt_pretax", "net_borrowing", "lease_financing"],
+            yearly("interest"))
         add("step_net_income", "税后净利合计", total("net_income"), "亿元",
-            f"净利_t = (EBIT_t − 利息) × (1 − 税率 {tax:.2%})",
+            f"净利_t = (EBIT_t − 利息) × (1 − 税率 {tax:.2%})，合并口径",
             ["step_ebit", "step_interest", "tax_rate_ltm", "tax_rate_hist"], yearly("net_income"))
+        add("step_minority_profit", "少数股东损益合计", total("minority"), "亿元",
+            f"少数股东损益_t = 营收_t × 少数股东损益率 {params.get('minority_ratio', 0.0):.2%}"
+            f"（LTM 少数股东损益 {params.get('minority_profit_ltm', 0.0):,.2f} 亿 ÷ LTM 营收）",
+            ["step_revenue", "minority_profit_ltm", "revenue_ltm"], yearly("minority"))
         add("step_financing", "债务净融资（每年）", params.get("net_financing"), "亿元",
-            "净借款流入 + 租赁净融资：FCFE 口径下这是股东当年实际增减的借来资金"
+            "净债务融资 + 租赁净融资：FCFE 口径下这是股东当年实际增减的借来资金"
             + ("（每年同额，首年按残期折算）" if stub < 1.0 else ""),
             ["net_borrowing", "lease_financing"])
         add(f"step_{flow.lower()}", f"{flow} 合计", total("fcfe"), "亿元",
-            f"{flow}_t = 净利_t + D&A_t − CapEx_t − ΔNWC_t + 债务净融资",
-            ["step_net_income", "step_da", "step_capex", "step_nwc", "step_financing"], yearly("fcfe"))
+            f"{flow}_t = 净利_t − 少数股东损益_t + D&A_t − CapEx_t − ΔNWC_t + 债务净融资",
+            ["step_net_income", "step_minority_profit", "step_da", "step_capex", "step_nwc", "step_financing"],
+            yearly("fcfe"))
 
     pv_row = f"pv_{flow.lower()}"
     if stub < 1.0:
@@ -719,14 +839,30 @@ def valuation_bridge(result: DcfResult, known: Iterable[str] | None = None) -> d
 
     growth = params.get("terminal_growth") or 0.0
     if result.terminal == "gordon":
-        add("step_terminal_value", "终值（永续）", result.terminal_value, "亿元",
-            f"末年{flow} × (1 + g) ÷ (r − g)，g = {growth:.2%}，r − g = {rate - growth:.2%}",
-            [f"step_{flow.lower()}", "terminal_growth", rate_row])
+        if is_fcff:
+            add("step_terminal_value", "终值（永续）", result.terminal_value, "亿元",
+                f"末年{flow} × (1 + g) ÷ (r − g)，g = {growth:.2%}，r − g = {rate - growth:.2%}",
+                [f"step_{flow.lower()}", "terminal_growth", rate_row])
+        else:
+            add("step_terminal_value", "终值（永续）", result.terminal_value, "亿元",
+                f"(末年{flow} − 当年净融资 {params.get('net_financing', 0.0):,.2f} 亿) × (1 + g) ÷ (r − g)，"
+                f"g = {growth:.2%}，r − g = {rate - growth:.2%}；永续那一段只放经营现金流，"
+                "把每年同一笔净融资也资本化等于假设债务永远按这个速度增长；少数股东损益已逐年扣掉",
+                [f"step_{flow.lower()}", "step_financing", "terminal_growth", rate_row])
     elif result.terminal == "uem":
-        add("step_terminal_value", "终值（UEM）", result.terminal_value, "亿元",
+        label = (
             f"末年NOPAT × (1 + g) × (1 − 再投资率 {params.get('reinvestment', 0.0):.1%}) ÷ (r − g)；"
-            f"再投资率 = g ÷ ROIC({params.get('roic', 0.0):.2%})，g = {growth:.2%}",
-            ["step_nopat", "terminal_growth", "roic_ltm", rate_row])
+            f"再投资率 = g ÷ ROIC({params.get('roic', 0.0):.2%})，g = {growth:.2%}"
+        )
+        upstream = ["step_nopat", "terminal_growth", "roic_ltm", rate_row]
+        if not is_fcff:
+            label += (
+                f"，减终止年净债务 {params.get('debt_terminal', 0.0):,.2f} 亿"
+                f"（报表余额 {params.get('debt_reported', 0.0):,.2f} + 显性期各年净融资 "
+                f"{params.get('debt_addition', 0.0):,.2f}）与少数股东权益 {params.get('minority_terminal', 0.0):,.2f} 亿"
+            )
+            upstream += ["net_debt", "net_borrowing", "lease_financing", "minority_interest"]
+        add("step_terminal_value", "终值（UEM）", result.terminal_value, "亿元", label, upstream)
     elif params.get("exit_multiple"):
         multiple = params["exit_multiple"]
         if is_fcff:
@@ -735,8 +871,12 @@ def valuation_bridge(result: DcfResult, known: Iterable[str] | None = None) -> d
                 ["step_ebit", "step_da", "exit_ev_ebitda"])
         else:
             add("step_terminal_value", "终值（退出倍数）", result.terminal_value, "亿元",
-                f"末年税后净利 × 退出市盈率 {multiple:.2f}x（倍数取自「{params.get('multiple_row')}」）",
-                ["step_net_income", str(params.get("multiple_row"))])
+                f"末年 EBITDA（EBIT + D&A）{params.get('ebitda_terminal', 0.0):,.2f} 亿 × EV/EBITDA {multiple:.2f}x，"
+                f"减终止年净债务 {params.get('debt_terminal', 0.0):,.2f} 亿"
+                f"（报表余额 {params.get('debt_reported', 0.0):,.2f} + 显性期各年净融资 "
+                f"{params.get('debt_addition', 0.0):,.2f}）与少数股东权益 {params.get('minority_terminal', 0.0):,.2f} 亿",
+                ["step_ebit", "step_da", "exit_ev_ebitda", "net_debt", "net_borrowing", "lease_financing",
+                 "minority_interest"])
 
     add("step_pv_terminal", "终值现值", result.pv_terminal, "亿元",
         f"终值 ÷ (1 + r)^{params.get('t_terminal', float(len(lines))):g}，r = {rate:.2%}",
@@ -745,7 +885,12 @@ def valuation_bridge(result: DcfResult, known: Iterable[str] | None = None) -> d
         "企业价值 EV" if is_fcff else "股权价值",
         result.enterprise_value if is_fcff else result.equity_value, "亿元",
         f"显性期现值合计 + 终值现值（{flow} 折出来的是全投资人的钱，故先落企业价值）" if is_fcff
-        else "显性期现值合计 + 终值现值：FCFE 折的就是股东的钱，不再桥接净债务",
+        else ("显性期现值合计 + 终值现值：退出倍数那一步已经按终止年的净债务与少数股东过桥，这里不再减"
+              if result.terminal == "exit_multiple"
+              else ("显性期现值合计 + 终值现值：UEM 那一步已经按终止年的净债务与少数股东过桥，这里不再减"
+                    if result.terminal == "uem"
+                    else "显性期现值合计 + 终值现值：FCFE 折的就是股东的钱，显性期的净融资按流入计入，"
+                         "永续那一步只用经营 FCFE，不再桥接净债务")),
         ["step_pv_explicit", "step_pv_terminal"])
 
     bridge_from = "step_enterprise_value" if is_fcff else "step_equity_value"
