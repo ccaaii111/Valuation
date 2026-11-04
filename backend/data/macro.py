@@ -18,6 +18,7 @@ from datetime import date, timedelta
 from io import StringIO
 from typing import Any
 
+from backend.data import marketcache
 from backend.data.transport import Fetched, RunStore, now_iso
 
 RAW_NAME = "risk_free"
@@ -60,11 +61,16 @@ def fetch(days: int = WINDOW_DAYS) -> Fetched:
 
     rows = [{"日期": str(item[0])[:10], SERIES: _numeric(item[1])} for item in frame[["日期", SERIES]].itertuples(index=False, name=None)]
     payload = {"source": f"akshare {AKSHARE_FUNC}", "url": SOURCE_URL, "column": SERIES, "rows": rows}
+    return _seal(payload, now_iso())
+
+
+def _seal(payload: dict, fetched_at: str) -> Fetched:
+    """把载荷封成凭证：联网新取的与缓存复用的走同一个封口，摘要算法因此不可能两边漂。"""
     text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return Fetched(
         name=RAW_NAME,
         url=SOURCE_URL,
-        fetched_at=now_iso(),
+        fetched_at=fetched_at,
         sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         payload=payload,
     )
@@ -180,11 +186,16 @@ def _provenance(stats: dict, tail: str) -> str:
     )
 
 
-def risk_free_stats(store: RunStore | None = None, live: bool = True) -> tuple[dict | None, str]:
+def risk_free_stats(
+    store: RunStore | None = None, live: bool = True, cache: marketcache.Cache | None = None
+) -> tuple[dict | None, str]:
     """(stats, provenance) for the ladder — one snapshot, both numbers, recorded for the audit trail.
 
     A run that already carries the snapshot reads from it, so --from-run stays offline; a fresh run
     fetches and records. `live=False` forbids the fallback fetch.
+
+    `cache` 是本机的市场级缓存（国债序列与个股无关，一天下一遍就够）：命中就不联网，把缓存里那份原始答复
+    照样记进这一批的 `raw/`，取数时刻用的是它真正联网那一刻。
     """
     if store is not None:
         recorded = store.load(RAW_NAME)
@@ -194,6 +205,14 @@ def risk_free_stats(store: RunStore | None = None, live: bool = True) -> tuple[d
         if not live:
             return None, f"unavailable: 批次 {store.snapshot_ref} 没有 {RAW_NAME} 快照，--from-run 不重新联网"
 
+    cached = cache.read(marketcache.RISK_FREE) if cache is not None else None
+    if cached is not None:
+        item = _seal(cached.payload, cached.fetched_at)
+        if store is not None:
+            store.record(item)
+        stats = window_stats(item.payload)
+        return stats, _provenance(stats, f"，本机市场缓存复用，取数于 {cached.fetched_at}")
+
     try:
         item = fetch()
     except MacroUnavailable as exc:
@@ -202,4 +221,10 @@ def risk_free_stats(store: RunStore | None = None, live: bool = True) -> tuple[d
     if store is not None:
         store.record(item)
     stats = window_stats(item.payload)
+    if cache is not None and stats.get("spot") is not None:
+        # 即期读数不靠谱（单位跳变、整列空）时不落缓存：那份答复还没被认可，缓存不该替它续命一天。
+        cache.save(
+            marketcache.RISK_FREE, item.payload, fetched_at=item.fetched_at,
+            last_day=stats.get("last_day") or "", source=f"akshare {AKSHARE_FUNC}", url=SOURCE_URL,
+        )
     return stats, _provenance(stats, f"，取数于 {item.fetched_at}")
