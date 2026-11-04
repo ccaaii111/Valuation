@@ -417,7 +417,12 @@ def start_fetch(body: dict) -> dict:
         raise ValueError(status["reason"])
     return {
         "job_id": jobs.start(
-            ticker.code, builder.BuildOptions(code=ticker.code, beta=beta, benchmark=benchmark)
+            ticker.code,
+            # 强制重取要的是「一份新答复」，所以市场级缓存（国债序列、指数收盘、全市场股息率）也一并绕过；
+            # 不强制时这些与个股无关的序列当天取过一次就复用，判新旧仍看 manifest 里那次真实联网时刻。
+            builder.BuildOptions(
+                code=ticker.code, beta=beta, benchmark=benchmark, no_market_cache=bool(body.get("force"))
+            ),
         ),
         "code": ticker.code,
         "benchmark": benchmark,
