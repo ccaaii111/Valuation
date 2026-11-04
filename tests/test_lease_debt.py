@@ -11,10 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from backend.model.assumptions import LEASE_DEBT_KEYS, _sum  # noqa: E402
+from backend.model.assumptions import LEASE_DEBT_KEYS, _sum, build_ladder  # noqa: E402
 from backend.model.dcf import apply_overrides, evaluate, inputs_from_ladder  # noqa: E402
-from backend.model.periods import twelve_months_ago  # noqa: E402
-from fixtures import LEASE_LIAB, synthetic_ladder  # noqa: E402
+from backend.model.periods import ltm, ltm_flow, twelve_months_ago  # noqa: E402
+from fixtures import LEASE_LIAB, YI, synthetic_ladder, synthetic_snapshot  # noqa: E402
 
 LADDER = synthetic_ladder()
 BASE = inputs_from_ladder(LADDER)
@@ -51,8 +51,11 @@ def test_lease_financing_is_the_twelve_month_delta() -> None:
 def test_lease_financing_only_moves_fcfe() -> None:
     with_lease = evaluate({**BASE, "lease_financing": 100.0}, "fcfe", "gordon", rate=0.09)
     without = evaluate({**BASE, "lease_financing": 0.0}, "fcfe", "gordon", rate=0.09)
-    check("FCFE 每年多出租赁净融资", all(abs(p.fcfe - q.fcfe - 100.0) < 1e-6 for p, q in zip(with_lease.lines, without.lines)),
-          f"{[round(p.fcfe - q.fcfe, 6) for p, q in zip(with_lease.lines, without.lines)]}")
+    tax, kd = with_lease.params["tax"], with_lease.params["cost_of_debt"]
+    deltas = [p.fcfe - q.fcfe for p, q in zip(with_lease.lines, without.lines)]
+    expected = [100.0 - 100.0 * (1.0 + i) * kd * (1.0 - tax) for i in range(len(deltas))]
+    check("FCFE 多出租赁净融资，也多付这笔债务的税后利息", all(abs(d - e) < 1e-6 for d, e in zip(deltas, expected)),
+          f"{[round(d, 6) for d in deltas]}")
     fcff_with = evaluate({**BASE, "lease_financing": 100.0}, "fcff", "gordon")
     fcff_plain = evaluate({**BASE, "lease_financing": 0.0}, "fcff", "gordon")
     check("FCFF 不受租赁净融资影响", fcff_with.per_share == fcff_plain.per_share, f"{fcff_with.per_share} vs {fcff_plain.per_share}")
@@ -63,8 +66,33 @@ def test_debt_base_shares_one_interest_bill() -> None:
     levered = evaluate(BASE, "fcfe", "gordon", rate=0.09)
     plain = evaluate(EXCLUDED, "fcfe", "gordon", rate=0.09)
     interest = levered.lines[0].interest - plain.lines[0].interest
-    expected = (BASE["interest_bearing_debt"] - EXCLUDED["interest_bearing_debt"]) * BASE["cost_of_debt_pretax"]
-    check("每年利息按含租赁的债务基数计提", abs(interest - expected) < 1e-6, f"利息差 {interest:.3f} vs {expected:.3f}")
+    expected = ((BASE["interest_bearing_debt"] - EXCLUDED["interest_bearing_debt"]) + BASE["lease_financing"]) \
+        * BASE["cost_of_debt_pretax"]
+    check("利息按含租赁的债务基数与当年租赁净融资计", abs(interest - expected) < 1e-6, f"利息差 {interest:.3f} vs {expected:.3f}")
+
+
+def test_bond_issuance_enters_net_financing() -> None:
+    snapshot = synthetic_snapshot()
+    for row in snapshot["cashflow"]:
+        row["ISSUE_BOND"] = 7 * YI if row["REPORT_DATE"] == "2025-12-31" else 0.0
+    built = build_ladder(snapshot, snapshot["consensus"], snapshot["quote"], 0.02, beta_manual=1.0)
+    row = next(r for r in built.rows() if r.key == "net_borrowing")
+    check("发债收现并入净债务融资", row.baseline == 20 - 15 + 7, str(row.baseline))
+    check("标签不再是只算借款", row.label == "净债务融资", row.label)
+    check("凭证写明三笔收付", "发债收现 7.00 亿元" in row.evidence, row.evidence)
+
+
+def test_bond_roll_treats_blank_as_no_issuance() -> None:
+    """002156 的形态：本年三季报报了 5 亿发债，上年年报与上年同期留空。"""
+    rows = [
+        {"REPORT_DATE": "2026-09-30", "ISSUE_BOND": 5 * YI},
+        {"REPORT_DATE": "2025-12-31"},
+        {"REPORT_DATE": "2025-09-30"},
+    ]
+    check("空值按没发生处理，滚动仍出数", ltm_flow(rows, "ISSUE_BOND") == 5 * YI, str(ltm_flow(rows, "ISSUE_BOND")))
+    check("严格口径会把这十二个月判成缺失", ltm(rows, "ISSUE_BOND") is None)
+    check("本期也没报数时不出数",
+          ltm_flow([{"REPORT_DATE": "2026-09-30"}, {"REPORT_DATE": "2025-12-31", "ISSUE_BOND": 3 * YI}], "ISSUE_BOND") is None)
 
 
 def test_lease_financing_is_editable() -> None:
