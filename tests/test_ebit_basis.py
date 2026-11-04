@@ -111,21 +111,44 @@ def test_note_carries_no_numbers() -> None:
         check(f"{key} 的说明行不含数字", not any(c.isdigit() for c in note), note)
 
 
-def test_consensus_stays_on_operate_profit() -> None:
+def test_consensus_is_shifted_onto_the_ebit_basis() -> None:
     lad = ladder(interest=8.9)
     r = row(lad, "ebit_margin_consensus")
-    # fixture 的 2026 预期：营业利润 330 亿 ÷ 营收 1100 亿 = 30%，2027 是 355/1180
-    check("一致预期档仍是券商营业利润率", close(r["baseline"]["2026"], 0.30) and close(r["baseline"]["2027"], 355 / 1180),
+    # fixture 的营业利润恒为营收的 30%；加回 8.9 亿利息后机器 EBIT 率 LTM 是 308.9/1000，
+    # 平移额 = 308.9/1000 − 0.30。券商原值 2026 是 330/1100、2027 是 355/1180。
+    shift = 308.9 / 1000 - 0.30
+    check("一致预期整体平移到机器口径",
+          close(r["baseline"]["2026"], 330 / 1100 + shift) and close(r["baseline"]["2027"], 355 / 1180 + shift),
           str(r["baseline"]))
-    check("凭证并列两档并声明不可互为校验", "券商营业利润率均值" in r["evidence"] and "不能互为校验" in r["evidence"],
-          r["evidence"])
+    check("平移额记进 raw", close(r["raw"]["margin_shift"], shift, 1e-6), str(r["raw"]))
+    check("券商原值留在 raw 当对照", close(r["raw"]["broker_margin"]["2026"], 0.30, 1e-6)
+          and close(r["raw"]["operating_margin_ltm"], 0.30, 1e-6), str(r["raw"]))
+    check("凭证写平移额", "平移额" in r["evidence"] and "券商营业利润率均值" in r["evidence"], r["evidence"])
     start = row(lad, "ebit_margin_start")
-    check("首年有锚时站券商口径", close(start["baseline"], 0.30) and "一致预期首年" in start["source"], start["source"])
+    check("首年有锚时用平移后的券商预测", close(start["baseline"], 330 / 1100 + shift)
+          and start["source"].startswith("一致预期首年"), start["source"])
+
+
+def test_margin_path_follows_the_shifted_level() -> None:
+    """路径两端同一口径：锚点年用平移后的券商预测，其后逐年向机器 EBIT 率均值靠近。"""
+    lad = ladder(interest=8.9)
+    start = row(lad, "ebit_margin_start")["baseline"]
+    hist = row(lad, "ebit_margin_hist")["baseline"]
+    consensus = {int(year): value for year, value in row(lad, "ebit_margin_consensus")["baseline"].items()}
+    path = {int(year): value for year, value in row(lad, "ebit_margin_path")["baseline"].items()}
+    check("路径首年就是首年率", close(path[min(path)], start), f"{path[min(path)]} vs {start}")
+    check("锚点年照抄平移后的券商值", all(close(path[year], value) for year, value in consensus.items()), str(path))
+    last_anchor = max(consensus)
+    fade = [(last_anchor, consensus[last_anchor])] + [(y, v) for y, v in sorted(path.items()) if y > last_anchor]
+    check("回落段逐年靠近历史均值",
+          len(fade) > 1 and all(abs(b - hist) < abs(a - hist) for (_, a), (_, b) in zip(fade, fade[1:])), str(path))
+    check("末年仍在历史均值同一侧", (path[max(path)] - hist) * (consensus[last_anchor] - hist) > 0,
+          f"{path[max(path)]} vs {hist}")
 
 
 def test_adjustment_reaches_the_engine() -> None:
-    # 有锚时盈利路径站在券商口径上，这一批里 EBIT 率改动只影响 ROIC 与现价反推的退出倍数，
-    # 所以按这两个单通道下游验，不比每股——每股那一路还混着债务成本实测。
+    # 机器 EBIT 率的改动经平移额也流进券商锚点年，所以盈利路径整体抬起来；这里仍按单通道下游验，
+    # 不比每股——每股那一路还混着债务成本实测。
     addback = ladder(fairvalue=-12.0)
     plain = ladder()
     check("调整后比率流入引擎", close(inputs_from_ladder(addback)["ebit_margin_ltm"], 312.0 / 1000),
