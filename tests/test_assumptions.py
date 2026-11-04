@@ -92,6 +92,33 @@ def test_consensus_anchor_path() -> None:
     check("回归不超过目标位", all(v >= 0.25 for v in margins.values()), str({k: round(v, 4) for k, v in margins.items()}))
 
 
+def test_manual_growth_years_release_the_anchors_from_then_on() -> None:
+    """人工改过增速的最早那一年起（含）一致预期不再钉住营收：只放开被点名的那一年，次年机构数又把它按回去，增速改多大都只动一年的现金流。"""
+    growth = {year: 0.10 for year in range(2026, 2031)}
+    anchors = {2026: 1250.0, 2027: 1180.0}
+    base = 1000.0
+
+    quiet = build_revenue_path(growth, anchors, base)
+    check("不点名人工年份时锚点年仍取一致预期", quiet[2026] == 1250.0 and quiet[2027] == 1180.0, str(quiet))
+    check("不点名时未覆盖年按增速往上乘", abs(quiet[2028] - 1180.0 * 1.10) < 1e-9, str(quiet[2028]))
+    check("空点名列表等于不点名", build_revenue_path(growth, anchors, base, []) == quiet)
+
+    from_first = build_revenue_path(growth, anchors, base, [2026])
+    check("点名首年时首年改从基期往上乘", abs(from_first[2026] - 1100.0) < 1e-9, str(from_first[2026]))
+    check("点名首年之后锚点年也不再钉住", abs(from_first[2027] - 1210.0) < 1e-9, str(from_first[2027]))
+    check("接管后整段就是手工复利", all(abs(from_first[y] - base * 1.10 ** (y - 2025)) < 1e-6 for y in growth), str(from_first))
+
+    from_second = build_revenue_path(growth, anchors, base, [2027])
+    check("点名次年时更早的锚点照旧生效", from_second[2026] == 1250.0, str(from_second[2026]))
+    check("点名次年起按上一个锚点往上乘", abs(from_second[2027] - 1375.0) < 1e-9, str(from_second[2027]))
+    check("多个点名年份取最早那一年起接管", build_revenue_path(growth, anchors, base, [2027, 2029]) == from_second)
+    check("字符串年份同样认得", build_revenue_path(growth, anchors, base, ["2027"]) == from_second)
+
+    from_tail = build_revenue_path(growth, anchors, base, [2029])
+    check("点名锚点之后的年份时每格都与不点名相同", from_tail == quiet, str(from_tail))
+    check("没有锚点的批次点名也一样按增速乘", build_revenue_path(growth, {}, base, [2026]) == build_revenue_path(growth, {}, base, None))
+
+
 def test_horizon_is_an_input_not_a_by_product_of_coverage() -> None:
     """显性期年数是人的选择；旧口径里它是 max(5, 锚点数 + 2)，券商写到第几年就走第几年、回落段恒为魔法数 2 年。
 
@@ -147,6 +174,58 @@ def test_nwc_never_double_counts_combined_caption() -> None:
     merged.pop("NOTE_ACCOUNTS_PAYABLE")
     check("缺合并科目时回退子科目", _nwc(merged) is not None, str(_nwc(merged)))
     check("空行返回 None", _nwc(None) is None and _nwc({}) is None)
+
+
+def test_nwc_includes_operating_financing_items() -> None:
+    """经营融资项必须进营运资本：合同负债与应付职工薪酬是占用别人的钱，预付款项是自己占用的钱。
+
+    缺这些科目时按缺项处理（不按 0 补），老批次的行没有这几个键，数值与从前一致。
+    """
+    from backend.model.assumptions import _nwc
+
+    base = {
+        "NOTE_ACCOUNTS_RECE": 100e8,
+        "INVENTORY": 80e8,
+        "NOTE_ACCOUNTS_PAYABLE": 50e8,
+        "TAX_PAYABLE": 10e8,
+    }
+    check("缺新科目时与旧口径一致", abs(_nwc(base) - 120e8) < 1e6, f"{_nwc(base) / 1e8:,.2f} 亿元")
+    with_items = dict(base, CONTRACT_LIAB=30e8, PREPAYMENT=12e8, STAFF_SALARY_PAYABLE=2e8)
+    check("合同负债与应付职工薪酬冲减营运资本", abs(_nwc(with_items) - 100e8) < 1e6, f"{_nwc(with_items) / 1e8:,.2f} 亿元")
+    check("合同负债单独计入后营运资本变小", _nwc(dict(base, CONTRACT_LIAB=30e8)) < _nwc(base))
+
+
+def test_nwc_weighting_prefers_recent_years() -> None:
+    """比率按 1~5 加权（最近一年权重 5），不是五年算术均值，也不是基期余额回归。
+
+    夹具造出逐年递增的水平比 1%、2%、3%、4%、5%：算术均值是 3.00%，这一档是 3.6667%。
+    两个数不一样，权重方向就钉住了；最早一年与最近一年同权重的写法会在这里变红。
+    """
+    from backend.model.assumptions import build_ladder
+    from fixtures import REVENUE, YI, synthetic_snapshot
+
+    snapshot = synthetic_snapshot()
+    targets = {2021: 0.01, 2022: 0.02, 2023: 0.03, 2024: 0.04, 2025: 0.05}
+    for row in snapshot["balance"]:
+        year = int(row["REPORT_DATE"][:4])
+        # 应付那一档固定是营收的 8%，把应收抬到（目标比率 + 8%）× 营收
+        row["NOTE_ACCOUNTS_RECE"] = (targets[year] + 0.08) * REVENUE[year] * YI
+    ladder = build_ladder(snapshot, snapshot["consensus"], snapshot["quote"], 0.02,
+                          normalize=False, beta_manual=1.00).to_json()
+    rows = [r for g in ladder["groups"] for r in g["rows"]]
+    nwc_rows = [r for r in rows if r["key"].startswith("nwc")]
+    check("营运资本只留比率这一行", [r["key"] for r in nwc_rows] == ["nwc_to_revenue_level"],
+          str([r["key"] for r in nwc_rows]))
+    row = nwc_rows[0]
+    check("近大远小加权：(1×1%+2×2%+3×3%+4×4%+5×5%)/15 = 3.6667%",
+          abs(row["baseline"] - 0.036667) < 1e-6, str(row["baseline"]))
+    check("行标写明加权不写均值", "加权" in row["label"] and "均值" not in row["label"], row["label"])
+    check("凭证逐年给出余额、营收、比率与权重",
+          all(f"{y} " in row["evidence"] and f"×{w}" in row["evidence"]
+              for y, w in ((2021, 1), (2023, 3), (2025, 5))), row["evidence"])
+    check("凭证给出权重合计与加权结果", "权重合计 15" in row["evidence"] and "加权比率 3.67%" in row["evidence"],
+          row["evidence"][-40:])
+    check("说明行不夹这一批的数", not any(ch.isdigit() for ch in row["note"].replace("1~5", "")), row["note"])
 
 
 def test_ladder_covers_every_engine_input() -> None:
