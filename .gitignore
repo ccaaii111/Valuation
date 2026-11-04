@@ -4,6 +4,10 @@ runs/
 # 启动时自动刷新的股票名录索引（scripts/update_universe.py 的产物）
 data/universe.json
 
+# 本机市场级缓存：国债序列、指数收盘、全市场股息率（backend/data/marketcache.py 的产物）
+# 与名录同理——都是一只票都不相关的市场公共数据，本地重新取数即可再生，批次证据仍落在 runs/ 里
+data/market_cache/
+
 # Python
 __pycache__/
 *.py[cod]
