@@ -203,6 +203,53 @@ def test_annual_window_is_the_recent_years() -> None:
     check("剔除额逐年各算一遍", close(items[0].strip, STRIP_YI * YI) and close(items[-1].strip, STRIP_YI * YI))
 
 
+def test_fairvalue_moves_out_of_the_strip() -> None:
+    """EBIT 已经整行剔掉公允价值变动，官方 S 又含这一笔：反推额里属于它的那一段不能再剔第二次。
+
+    正 FV 一年：税前偶发额是 FV 10 + 投资收益 5，能剔的只有投资收益 5，剔 15 就是把 FV 走两遍；
+    负 FV 一年：税前偶发额是 −5（其中 FV −10），剩下那 +5 才是要剔的，符号跟着 gross − FV 走。
+    """
+    gain = year_row(
+        TOTAL_OPERATE_COST=700.0, INVEST_INCOME=5.0, FAIRVALUE_CHANGE_INCOME=10.0,
+        NONBUSINESS_INCOME=0.0, OPERATE_PROFIT=315.0, TOTAL_PROFIT=315.0,
+        INCOME_TAX=78.75, NETPROFIT=236.25, MINORITY_INTEREST=23.625,
+        PARENT_NETPROFIT=212.625, DEDUCT_PARENT_NETPROFIT=202.5,
+    )
+    item = NZ.normalize_year(2025, gain, _ebit(gain))
+    check("正 FV 一年过护栏", item.accepted, item.reason)
+    check("反推额含 FV", close(item.gross, 15.0 * YI), str(item.gross))
+    check("FV 单独记在行上", close(item.fairvalue, 10.0 * YI), str(item.fairvalue))
+    check("剔除额只剩投资收益那一截", close(item.strip, 5.0 * YI), str(item.strip))
+    check("EBIT 只被剔一次", close(item.ebit_normalized, 300.0 * YI, 1e-3), str(item.ebit_normalized))
+
+    loss = year_row(
+        TOTAL_OPERATE_COST=700.0, INVEST_INCOME=5.0, FAIRVALUE_CHANGE_INCOME=-10.0,
+        NONBUSINESS_INCOME=0.0, OPERATE_PROFIT=295.0, TOTAL_PROFIT=295.0,
+        INCOME_TAX=73.75, NETPROFIT=221.25, MINORITY_INTEREST=22.125,
+        PARENT_NETPROFIT=199.125, DEDUCT_PARENT_NETPROFIT=202.5,
+    )
+    item = NZ.normalize_year(2025, loss, _ebit(loss))
+    check("负 FV 一年过护栏", item.accepted, item.reason)
+    check("反推额是净支出", close(item.gross, -5.0 * YI), str(item.gross))
+    check("剔除额回到剩下的 +5", close(item.strip, 5.0 * YI), str(item.strip))
+    check("负 FV 不会把 EBIT 反向抬高", close(item.ebit_normalized, 300.0 * YI, 1e-3), str(item.ebit_normalized))
+
+
+def test_fairvalue_alone_leaves_ebit_as_is() -> None:
+    """FV 是唯一的偶发项：它已经不在 EBIT 里，所以没有东西可搬，剔除额就是 0。"""
+    row = year_row(
+        TOTAL_OPERATE_COST=700.0, INVEST_INCOME=0.0, FAIRVALUE_CHANGE_INCOME=10.0,
+        NONBUSINESS_INCOME=0.0, OPERATE_PROFIT=310.0, TOTAL_PROFIT=310.0,
+        INCOME_TAX=77.5, NETPROFIT=232.5, MINORITY_INTEREST=23.25,
+        PARENT_NETPROFIT=209.25, DEDUCT_PARENT_NETPROFIT=202.5,
+    )
+    item = NZ.normalize_year(2025, row, _ebit(row))
+    check("FV 单独一年仍过护栏", item.accepted, item.reason)
+    check("反推额等于 FV", close(item.gross, item.fairvalue), f"{item.gross} / {item.fairvalue}")
+    check("剔除额为 0", close(item.strip, 0.0), str(item.strip))
+    check("正常化 EBIT 就是 EBIT", close(item.ebit_normalized, item.ebit), str(item.ebit_normalized))
+
+
 # ----------------------------------------------------------------------- 级联层
 
 
