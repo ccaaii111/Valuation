@@ -46,16 +46,24 @@ LEASE_DEBT_KEYS = ("LEASE_LIAB",)
 CASH_KEYS = ("MONETARYFUNDS", "TRADE_FINASSET")
 # GBALANCE carries both the combined caption (应收票据及应收账款) and its subset (应收账款);
 # summing across a group double-counts the subset, so within a group the first present key wins.
-RECEIVABLE_GROUPS = (("NOTE_ACCOUNTS_RECE", "ACCOUNTS_RECE"), ("INVENTORY",))
-PAYABLE_GROUPS = (("NOTE_ACCOUNTS_PAYABLE", "ACCOUNTS_PAYABLE"), ("TAX_PAYABLE",))
+RECEIVABLE_GROUPS = (("NOTE_ACCOUNTS_RECE", "ACCOUNTS_RECE"), ("INVENTORY",), ("PREPAYMENT",))
+PAYABLE_GROUPS = (
+    ("NOTE_ACCOUNTS_PAYABLE", "ACCOUNTS_PAYABLE"),
+    ("TAX_PAYABLE",),
+    ("CONTRACT_LIAB",),
+    ("STAFF_SALARY_PAYABLE",),
+)
 
 CAPEX_KEY = "CONSTRUCT_LONG_ASSET"
 BORROW_IN_KEY = "RECEIVE_LOAN_CASH"
+BOND_IN_KEY = "ISSUE_BOND"
 REPAY_OUT_KEY = "PAY_DEBT_CASH"
 # 财务费用下的利息支出。FINANCE_EXPENSE 是财务费用净额（茅台为负，因为存款利息抵过了），不能当分子。
 INTEREST_EXPENSE_KEYS = ("FE_INTEREST_EXPENSE",)
 # 滚动市盈率的分子。用归母而不是净利润：市值买的是归属普通股股东那一份，少数股东那份利润不在里面。
 PARENT_NET_PROFIT_KEY = "PARENT_NETPROFIT"
+# 少数股东损益：合并净利润里不归母公司的部分。FCFE 从合并 EBIT 出发，逐年在税后净利里扣掉这一份。
+MINORITY_PROFIT_KEY = "MINORITY_INTEREST"
 
 # 显性预测期是口径选择，不是测算结果：进级联的年数由人定（默认 10 年，评估实务那句「一般 8–12 年」），
 # 每年回落几个点是它的输出。稳态不测——它由「第几年进入稳态」这个选择定义，所以回落段必须走完在显性期内，
@@ -72,6 +80,12 @@ TERMINAL_GROWTH = 0.025
 ERP = 0.060
 PRETAX_COST_OF_DEBT = 0.031
 MARGIN_LOOKBACK = 5
+# 有效税率的可用区间。报表比率 = 所得税费用 ÷ 利润总额：负值来自递延所得税或亏损年度，
+# 高于 25% 多来自不可抵扣项与一次性补税。两者都不适合原样乘进 NOPAT，越界先退回近五年均值，
+# 历史均值也越界才按法定 25% 计。
+TAX_RATE_MIN = 0.0
+TAX_RATE_MAX = 0.25
+STATUTORY_TAX_RATE = 0.25
 
 # 营收增速序列的三情形窗口（进级联的第四档不看这条序列，见下面 SUSTAINABLE_WINDOW）。
 # 中枢用「近五年营收增量合计 ÷ 基数合计」（即以上一年营收加权的年均增速），
@@ -133,6 +147,7 @@ DERIVES: dict[str, tuple[str, ...]] = {
     "revenue_path": ("revenue_growth_path", "consensus_revenue", "revenue_base"),
     # 盈利：首年取一致预期、缺锚退 LTM，其后向近五年均值回落。年份跟着增速路径走，所以那条边也在此声明。
     # 两档 EBIT 率的分子都减过非经常性损益，所以那条边从「剔除额」行出发——关掉它两行都退回报表原值。
+    # 一致预期行在建链时整体平移过（券商营业利润率 → 机器 EBIT 率），平移额是这一批的常数，随行凭证走，不另立边。
     "ebit_margin_ltm": ("revenue_ltm", "normalization_strip"),
     "ebit_margin_hist": ("normalization_strip",),
     "ebit_margin_start": ("ebit_margin_consensus", "ebit_margin_ltm", "consensus_revenue"),
@@ -230,6 +245,21 @@ def _ratio(numerator: float | None, denominator: float | None) -> float | None:
     return numerator / denominator
 
 
+def bounded_tax_rate(ltm: float | None, hist: float | None) -> tuple[float, str | None]:
+    """定价用的有效税率与退回说明。区间 [0, 25%]：LTM 越界先退近五年均值，均值也越界按 25% 计。"""
+    in_range = lambda value: value is not None and TAX_RATE_MIN <= value <= TAX_RATE_MAX  # noqa: E731
+    if in_range(ltm):
+        return ltm, None
+    if ltm is None:
+        if in_range(hist):
+            return hist, f"有效税率 LTM 缺失，退回近五年均值 {hist:.2%}"
+        return STATUTORY_TAX_RATE, "有效税率缺失，按法定 25% 计"
+    if in_range(hist):
+        return hist, f"有效税率 LTM {ltm:.2%} 越界（应在 0~25%），退回近五年均值 {hist:.2%}"
+    hist_note = "缺失" if hist is None else f"{hist:.2%} 也越界"
+    return STATUTORY_TAX_RATE, f"有效税率 LTM {ltm:.2%} 越界（应在 0~25%），近五年均值{hist_note}，按法定 25% 计"
+
+
 def _sum(row: dict | None, keys: Iterable[str]) -> float | None:
     if not row:
         return None
@@ -299,17 +329,26 @@ def _ebit_evidence(bridge: list[tuple[str, float]]) -> str:
     )
 
 
-def _margin_basis_gap(consensus: dict[int, float], ltm: float | None, basis: str = "调整后") -> str:
-    """券商那档是营业利润率、历史那档是机器 EBIT 率：两个数并列摆出，不做换算。"""
-    if not consensus:
+def _margin_shift_evidence(
+    broker: dict[int, float], operating: float | None, ltm: float | None,
+    shifted: dict[int, float], basis: str = "调整后",
+) -> str:
+    """券商只预测营业利润率，历史那档是机器 EBIT 率：把整体平移的来龙去脉写成凭证。"""
+    if not broker:
         return "本批次无一致预期锚点"
-    mean_consensus = sum(consensus.values()) / len(consensus)
-    years = "、".join(str(year) for year in sorted(consensus))
-    measured = f"本批次无{basis} EBIT 率可比" if ltm is None else f"{basis}口径 LTM {ltm:.2%}"
+    years = "、".join(str(year) for year in sorted(broker))
+    mean_broker = sum(broker.values()) / len(broker)
+    if operating is None or ltm is None or not shifted:
+        return (
+            f"锚定年份 {years}，券商营业利润率均值 {mean_broker:.2%}。"
+            f"本批次缺营业利润率 LTM 或{basis} EBIT 率 LTM，券商档未平移：锚点年与回落终点的分子定义仍不同"
+        )
+    shift = ltm - operating
+    mean_shifted = sum(shifted.values()) / len(shifted)
     return (
-        f"锚定年份 {years}，券商营业利润率均值 {mean_consensus:.2%}；{measured}。"
-        "两档分子定义不同：券商档只预测营业利润，科目调整与非经常性损益剔除都不做；"
-        "一个是未来、一个是历史，这两个数不能互为校验"
+        f"锚定年份 {years}：券商营业利润率均值 {mean_broker:.2%}，同口径机器营业利润率 LTM {operating:.2%}；"
+        f"平移额 {shift * 100:+.2f} 个百分点（＝{basis} EBIT 率 LTM {ltm:.2%} − 营业利润率 LTM {operating:.2%}），"
+        f"平移后均值 {mean_shifted:.2%}。各年之间按券商原样的相对变化保留，只换水平"
     )
 
 
@@ -515,12 +554,25 @@ def build_growth_path(
     return glide_growth(anchors, base_revenue, fallback_growth, target, years), anchors, horizon
 
 
-def build_revenue_path(growth: dict[int, float], anchors: dict[int, float], base_revenue: float | None) -> dict[int, float]:
+def build_revenue_path(
+    growth: dict[int, float],
+    anchors: dict[int, float],
+    base_revenue: float | None,
+    manual_years: list[int] | None = None,
+) -> dict[int, float]:
+    """逐年营收：有锚点的年直接取一致预期，其余年按增速往上乘。
+
+    `manual_years` 是人工改过增速的那些年份（来自面板/CLI 的逐年修正）。最早那一年一起（含它往后）
+    一致预期就不再钉住营收，改按增速续上去：只让被点名的那一年脱离锚点的话，次年机构数又把它抹平，
+    增速改到多大都只动一年的现金流。
+    """
+    takeover = min((int(year) for year in manual_years), default=None) if manual_years else None
     running = base_revenue
     out: dict[int, float] = {}
     for year in sorted(growth):
-        if anchors.get(year):
-            running = anchors[year]
+        anchor = None if takeover is not None and year >= takeover else anchors.get(year)
+        if anchor:
+            running = anchor
         elif running:
             running *= 1.0 + growth[year]
         if running:
@@ -603,7 +655,24 @@ class BetaNotApplicable(ValueError):
     """β 在算术上不成立：CAPM 折不出可用的折现率，整条假设链不该继续。"""
 
 
-def measure_beta(prices: dict | None) -> tuple[float, str]:
+def beta_market_leg(prices: dict | None, benchmark_leg: dict | None) -> tuple[dict, str]:
+    """CAPM 的市场腿：有全收益孪生就用它，与 ERP 那条腿是同一个市场定义；没有才退回价格指数。
+
+    价格指数不含分红，把它当市场组合会把系统性收益少算一截，β 的对侧与 ERP 的对侧也就不再是同一把尺子。
+    孪生缺失不是错误：β 照旧回归，凭证里写明退回的是价格指数以及为什么。
+    """
+    block = benchmark_leg or {}
+    twin_closes = block.get("closes") or {}
+    label = benchmark_label(prices)
+    if twin_closes:
+        twin = block.get("twin") or "全收益指数"
+        return twin_closes, f"{label} 全收益指数 {twin}"
+    bench = (prices or {}).get("benchmark") or {}
+    why = block.get("unavailable") or "本批没有全收益指数"
+    return bench.get("closes") or {}, f"{label} 价格指数（{why}）"
+
+
+def measure_beta(prices: dict | None, benchmark_leg: dict | None = None) -> tuple[float, str]:
     """β from the run's price snapshot — 测到多少用多少，只有算术不成立才不出数。
 
     抛 BetaNotApplicable 的只有「算术上不成立」：重叠周数少到拟合不出斜率、β 非正。β≤0 会把股权成本压到
@@ -620,8 +689,7 @@ def measure_beta(prices: dict | None) -> tuple[float, str]:
         )
 
     stock = (prices.get("stock") or {}).get("closes") or {}
-    bench = prices.get("benchmark") or {}
-    index = bench.get("closes") or {}
+    index, leg_text = beta_market_leg(prices, benchmark_leg)
     label = benchmark_label(prices)
     stats = beta_model.regress(stock, index)
     if stats.beta is None:
@@ -635,11 +703,11 @@ def measure_beta(prices: dict | None) -> tuple[float, str]:
     quality = f"{stats.observations} 周重叠 {stats.first_day}~{stats.last_day}，R²={stats.r_squared:.3f}，t={t_text}"
     if stats.beta <= 0:
         raise BetaNotApplicable(
-            f"β 为负（实测 {stats.beta:.3f}，{quality}，基准 {label}）→ CAPM 不适用该模型："
+            f"β 为负（实测 {stats.beta:.3f}，{quality}，市场腿 {leg_text}）→ CAPM 不适用该模型："
             "负 β 把股权成本压到无风险利率以下，Gordon 终值 1/(r−g) 会翻号。"
             "仍要用本模型就加 --beta 显式给定，否则这只票该换估值口径"
         )
-    evidence = f"{label} 周收益 OLS：{quality}，β={stats.beta:.3f}"
+    evidence = f"{leg_text} 周收益 OLS：{quality}，β={stats.beta:.3f}"
     if stats.observations < BETA_PRACTICE_MIN_WEEKS:
         evidence += f"；样本短于实务下限 {BETA_PRACTICE_MIN_WEEKS} 周，可能测到的是风格背离而非系统性风险"
     evidence += "；前复权价随除权重排，β 以本批次价格快照为准"
@@ -1331,6 +1399,7 @@ def build_ladder(
     include_lease_debt: bool = True,
     prices: dict | None = None,
     prices_source: str = "",
+    benchmark_leg: dict | None = None,
     rf_window: dict | None = None,
     rf_basis: str = "",
     terminal_basis: str = "conservative",
@@ -1349,6 +1418,7 @@ def build_ladder(
     revenue_annual = {y: v for y, v in revenue_annual.items() if v}
     revenue_ltm = P.ltm(snapshot["income"], *REVENUE_KEYS)
     net_profit_ltm = P.ltm(snapshot["income"], PARENT_NET_PROFIT_KEY)
+    minority_profit_ltm = P.ltm(snapshot["income"], MINORITY_PROFIT_KEY)
 
     estimate = consensus["estimate"]
     estimate_years = sorted(estimate)
@@ -1393,9 +1463,25 @@ def build_ladder(
     strip_ltm = normal_window[-1].strip if normal_window else None
     ebit_ltm_recurring = None if ebit_ltm is None else ebit_ltm - (strip_ltm or 0.0)
     margin_ltm = _ratio(ebit_ltm_recurring, revenue_ltm)
-    margin_consensus = {
+    # 券商只给营业利润率，回落终点是机器 EBIT 率：两档分子定义不同。把券商各年整体平移
+    # 「机器 EBIT 率 LTM − 营业利润率 LTM」这一个差，路径两端落在同一口径上，各年之间的相对变化按券商原样保留。
+    margin_consensus_broker = {
         y: _ratio(r.get("operate_profit"), r.get("revenue")) for y, r in estimate.items() if r.get("operate_profit")
     }
+    operating_margin_ltm = _ratio(P.ltm(snapshot["income"], "OPERATE_PROFIT"), revenue_ltm)
+    margin_shift = (
+        margin_ltm - operating_margin_ltm
+        if margin_ltm is not None and operating_margin_ltm is not None else None
+    )
+    margin_consensus = (
+        {y: value + margin_shift for y, value in margin_consensus_broker.items()}
+        if margin_shift is not None else dict(margin_consensus_broker)
+    )
+    # 平移做不成时路径两端仍是两套口径：上警告，不假装已经对齐。
+    margin_shift_warning = (
+        "一致预期锚点未能平移到机器 EBIT 率口径（缺营业利润率 LTM 或 EBIT 率 LTM），锚点年与回落终点的分子定义不同"
+        if margin_consensus_broker and margin_shift is None else None
+    )
     margin_hist = P.mean(_tail(margin_annual, MARGIN_LOOKBACK))
     margin_start = margin_consensus.get(first_estimate, margin_ltm)
     margin_path = build_margin_path(sorted(growth), margin_consensus, margin_hist, margin_start)
@@ -1406,6 +1492,8 @@ def build_ladder(
     )
     tax_ltm = _ratio(P.ltm(snapshot["income"], "INCOME_TAX"), P.ltm(snapshot["income"], "TOTAL_PROFIT"))
     tax_hist = P.mean(_tail(tax_annual, MARGIN_LOOKBACK))
+    # 定价用的税率：LTM 是报表实测值，越界（负值或高于 25%）先退近五年均值，均值也越界才按法定 25% 计。
+    tax_used, tax_fallback = bounded_tax_rate(tax_ltm, tax_hist)
 
     da_annual = _series_ratio({y: _sum(r, DA_KEYS) for y, r in cashflow_annual.items()}, revenue_annual)
     capex_annual = _series_ratio({y: P.num(r, CAPEX_KEY) for y, r in cashflow_annual.items()}, revenue_annual)
@@ -1428,15 +1516,30 @@ def build_ladder(
     da_ltm = _ratio(da_ltm_abs, da_window_revenue)
     capex_ltm = _ratio(capex_ltm_abs, revenue_ltm)
 
+    # 营运资本用比率随营收增量外推：比率是逐年（余额 ÷ 当年营收）的近大远小加权（权重 1~5，最近一年权重最大）。
+    # 不用差分比（ΔNWC ÷ Δ营收）：那是一条两个年度差额相除的比率，营收下滑的年份分母为负，
+    # 会把一笔占用现金的余额变动除成负的系数，乘到只涨不跌的预测增量上就成了年年释放现金，且系数没有界。
     nwc_annual = {y: _nwc(r) for y, r in balance_annual.items()}
     nwc_annual = {y: v for y, v in nwc_annual.items() if v is not None}
-    nwc_pull = []
+    nwc_level_obs: dict[int, float] = {}
     for year, value in sorted(nwc_annual.items()):
-        revenue_delta = (revenue_annual.get(year) or 0) - (revenue_annual.get(year - 1) or 0)
-        previous = nwc_annual.get(year - 1)
-        if previous is not None and revenue_delta:
-            nwc_pull.append((value - previous) / revenue_delta)
-    nwc_ratio = P.mean(nwc_pull[-MARGIN_LOOKBACK:])
+        revenue = revenue_annual.get(year)
+        if revenue:
+            nwc_level_obs[year] = value / revenue
+    nwc_window = sorted(nwc_level_obs)[-MARGIN_LOOKBACK:]
+    nwc_weights = list(range(1, len(nwc_window) + 1))
+    nwc_ratio = (sum(w * nwc_level_obs[y] for w, y in zip(nwc_weights, nwc_window)) / sum(nwc_weights)
+                 if nwc_window else None)
+    nwc_level_evidence = (
+        "逐年（余额 ÷ 当年营收）与权重："
+        + "、".join(
+            f"{y} {nwc_annual[y] / 1e8:.2f} 亿 ÷ {revenue_annual[y] / 1e8:.2f} 亿 = {nwc_level_obs[y]:.2%}×{w}"
+            for w, y in zip(nwc_weights, nwc_window)
+        )
+        + f"；权重合计 {sum(nwc_weights)}，加权比率 {nwc_ratio:.2%}。"
+        if nwc_window
+        else "年报里没有任何一年同时给得出营运资本与营收，比率无法计算。"
+    )
 
     head_balance = P.latest(snapshot["balance"])
     cash = _sum(head_balance, CASH_KEYS) or 0.0
@@ -1451,11 +1554,13 @@ def build_ladder(
     total_equity = P.num(head_balance, "TOTAL_EQUITY")
     net_debt = debt - cash
     borrow_in = P.ltm(snapshot["cashflow"], BORROW_IN_KEY)
+    # 发债与借款是并列的债务融资流入；偿还债务支付的现金本来就同时覆盖借款与债券本金，两边配平。
+    bond_in = P.ltm_flow(snapshot["cashflow"], BOND_IN_KEY)
     repay_out = P.ltm(snapshot["cashflow"], REPAY_OUT_KEY)
-    net_borrowing = (borrow_in or 0.0) - (repay_out or 0.0)
+    net_borrowing = (borrow_in or 0.0) + (bond_in or 0.0) - (repay_out or 0.0)
 
     # ROIC 的分子与 EBIT 率 LTM 用同一个数：进定价的分子只有一档，正常化了就两边都正常化。
-    nopat = (ebit_ltm_recurring or 0.0) * (1.0 - (tax_ltm if tax_ltm is not None else (tax_hist or 0.0)))
+    nopat = (ebit_ltm_recurring or 0.0) * (1.0 - tax_used)
     invested = (total_equity or 0.0) + debt - cash
     roic = _ratio(nopat, invested)
 
@@ -1477,10 +1582,10 @@ def build_ladder(
             raise BetaNotApplicable(f"--beta 给的是 {beta_manual}：β≤0 照样折不出可用的股权成本，人工值也得为正")
         beta, beta_evidence = beta_manual, "人工输入 (--beta / 面板 β 框)，未走回归"
     else:
-        beta, beta_evidence = measure_beta(prices)
+        beta, beta_evidence = measure_beta(prices, benchmark_leg)
         measured_beta = beta
     erp, erp_basis, erp_measured, erp_reason = pick_erp(market_stats)
-    cost_of_equity, wacc = derive_rates(risk_free, beta, erp, equity_weight, cost_of_debt_pretax, tax_ltm)
+    cost_of_equity, wacc = derive_rates(risk_free, beta, erp, equity_weight, cost_of_debt_pretax, tax_used)
 
     pct = lambda value: None if value is None else round(value, 6)  # noqa: E731
     yi = lambda value: None if value is None else round(value / 1e8, 4)  # noqa: E731
@@ -1586,7 +1691,8 @@ def build_ladder(
                 "yctj_list TOTAL_OPERATE_INCOME(E)",
                 kind="estimate",
                 confidence=anchor_confidence,
-                note="卖方一致预期的分年营收，显性期前几年的锚点；改它等于改整段收入路径的起点。",
+                note="卖方一致预期的分年营收，显性期前几年的锚点；改它等于改整段收入路径的起点。"
+                "人工改过上游增速的那一年起，这几行不再钉住营收，数还在这里但不进定价。",
                 evidence=anchor_note,
             ),
             Row("consensus_dispersion", "机构 EPS 分歧度 CV", "pct", {y: pct(d.get("cv")) for y, d in consensus["dispersion"].items()}, "jgyc 逐家预测", kind="estimate", note="越大越分歧，锚点越不可信"),
@@ -1602,7 +1708,7 @@ def build_ladder(
         [
             Row("ebit_margin_ltm", "EBIT 率 LTM", "pct", pct(margin_ltm),
                 f"{margin_basis} / TOTAL_OPERATE_INCOME",
-                note="没有任何券商锚点时，整条 EBIT 率路径由这一行起头；有锚的年份路径用券商口径，这一行只作对照。",
+                note="没有任何券商锚点时，整条 EBIT 率路径由这一行起头；有锚的年份路径用平移后的券商预测，这一行只作对照。",
                 evidence=_ebit_evidence(ebit_bridge) + "。" + normal_sentence,
                 raw=raw(ebit_ltm=yi(ebit_ltm_recurring))),
             Row("ebit_margin_hist", f"EBIT 率近{MARGIN_LOOKBACK}年均值", "pct", pct(margin_hist),
@@ -1623,20 +1729,27 @@ def build_ladder(
                 raw=raw(ebit_ltm_reported=yi(ebit_ltm)),
             ),
             Row("ebit_margin_consensus", "EBIT 率一致预期", "pct", {y: pct(v) for y, v in margin_consensus.items()},
-                "yctj_list 营业利润 / 营业总收入", kind="estimate", confidence=anchor_confidence,
-                note="卖方预测的营业利润率，不做科目调整。",
-                evidence=_margin_basis_gap(margin_consensus, margin_ltm, margin_basis_short)),
+                "yctj_list 营业利润 / 营业总收入，再按 LTM 两口径之差整体平移", kind="estimate", confidence=anchor_confidence,
+                note="卖方只预测营业利润率；这一行把各年整体平移成机器 EBIT 率口径，与回落终点同一口径，只换水平。",
+                evidence=_margin_shift_evidence(
+                    margin_consensus_broker, operating_margin_ltm, margin_ltm, margin_consensus, margin_basis_short
+                ),
+                raw=raw(
+                    broker_margin={str(y): _rounded_pct(v) for y, v in margin_consensus_broker.items()},
+                    operating_margin_ltm=_rounded_pct(operating_margin_ltm),
+                    margin_shift=_rounded_pct(margin_shift),
+                )),
             Row("ebit_margin_start", "显性期首年 EBIT 率", "pct", pct(margin_start),
-                f"一致预期首年，缺锚时用{margin_basis_short} EBIT LTM", kind="estimate",
-                note="有锚取券商口径、无锚取机器口径，两种口径的分子定义不同，取到哪一档看这一行的来源列。"),
+                f"一致预期首年（已平移），缺锚时用{margin_basis_short} EBIT LTM", kind="estimate",
+                note="有锚取平移后的券商预测、无锚取机器 EBIT LTM，两档同一口径。"),
             Row(
                 "ebit_margin_path",
                 "EBIT 率分年路径",
                 "pct",
                 {y: pct(v) for y, v in margin_path.items()},
-                "一致预期覆盖年 + 向近5年均值回落",
+                "一致预期覆盖年（已平移）+ 向近5年均值回落",
                 kind="estimate",
-                note="锚定年与回落终点分属两档分子：前者是券商的营业利润，后者是上面两行 EBIT 率的分子。",
+                note="锚定年与回落终点同口径：覆盖年取平移后的券商预测，其后逐年向历史均值回落。",
             ),
             Row(
                 "net_profit_ltm",
@@ -1647,8 +1760,23 @@ def build_ladder(
                 note="最近四个季度归属母公司股东的净利润合计，当前滚动市盈率那一行拿它作分母。",
                 evidence=f"报表截至 {snapshot['as_of']}。",
             ),
-            Row("tax_rate_ltm", "有效税率 LTM", "pct", pct(tax_ltm), "INCOME_TAX / TOTAL_PROFIT"),
-            Row("tax_rate_hist", f"有效税率近{MARGIN_LOOKBACK}年均值", "pct", pct(tax_hist), "GINCOME 年报序列"),
+            Row(
+                "tax_rate_ltm",
+                "有效税率 LTM",
+                "pct",
+                pct(tax_ltm),
+                "INCOME_TAX / TOTAL_PROFIT",
+                note="所得税费用 ÷ 利润总额；递延所得税与亏损年度会把这一格压成负数，定价实际采用哪一档看凭证。",
+                evidence=f"报表截至 {snapshot['as_of']}。" + (f"定价采用 {tax_used:.2%}：{tax_fallback}" if tax_fallback else ""),
+            ),
+            Row(
+                "tax_rate_hist",
+                f"有效税率近{MARGIN_LOOKBACK}年均值",
+                "pct",
+                pct(tax_hist),
+                "GINCOME 年报序列",
+                note="近五年年报同一比率的均值，LTM 越界时作为退路。",
+            ),
         ],
     )
 
@@ -1666,8 +1794,23 @@ def build_ladder(
             Row("capex_to_revenue_ltm", "资本支出/营收 LTM", "pct", pct(capex_ltm), CAPEX_KEY,
                 raw=raw(capex_ltm=yi(capex_ltm_abs))),
             Row("capex_to_revenue_hist", "资本支出/营收 近5年均值", "pct", pct(P.mean(_tail(capex_annual, MARGIN_LOOKBACK))), "GCASHFLOW 年报序列"),
-            Row("nwc_to_revenue_delta", "营运资本变动/营收变动", "pct", pct(nwc_ratio), "应收票据及应收账款+存货−应付票据及应付账款−应交税费 差分"),
+            Row(
+                "nwc_to_revenue_level",
+                "营运资本/营收 近5年加权",
+                "pct",
+                pct(nwc_ratio),
+                "（应收票据及应收账款+存货+预付款项−应付票据及应付账款−应交税费−合同负债−应付职工薪酬）÷ 营业总收入 年报序列，逐年值按 1~5 加权（最近一年权重 5）",
+                note="预测期每一年的营运资本变动 = 这一比率 × 当年营收增量，首年的上一年取最后年报营收；比率为负说明别人的钱多于自己压进去的钱，营收增长反而释放现金。",
+                evidence=nwc_level_evidence,
+            ),
         ],
+    )
+
+    financing_legs = [("借款收现", borrow_in), ("发债收现", bond_in), ("偿债付现", repay_out)]
+    net_borrowing_evidence = (
+        "滚动十二个月：" + "、".join(f"{name} {_fmt_yi(value)}" for name, value in financing_legs) + "。"
+        if any(value is not None for _, value in financing_legs)
+        else "滚动十二个月里借款、发债、偿债三笔收付都没有报数，净债务融资按 0 计。"
     )
 
     bridge_rows = [
@@ -1682,8 +1825,29 @@ def build_ladder(
             evidence="" if lease_debt is None else f"其中租赁负债(非流动) {yi(lease_debt)} 亿元。",
         ),
         Row("net_debt", "净债务", "亿元", yi(net_debt), "有息负债-现金", note="负值即净现金"),
+        Row(
+            "minority_profit_ltm",
+            "少数股东损益 LTM",
+            "亿元",
+            yi(minority_profit_ltm),
+            "GINCOME MINORITY_INTEREST 累计值滚动十二个月",
+            note="合并净利润里属于少数股东的那一份；FCFE 口径按 LTM 占营收比逐年扣掉，FCFF 不用。",
+            evidence=(
+                f"报表截至 {snapshot['as_of']}。"
+                if minority_profit_ltm is not None
+                else "报表未披露少数股东损益。"
+            ),
+        ),
         Row("minority_interest", "少数股东权益", "亿元", yi(minority), "GBALANCE"),
-        Row("net_borrowing", "净借款流入", "亿元", yi(net_borrowing), "GCASHFLOW 借款收现-偿债付现", note="仅 FCFE 口径使用"),
+        Row(
+            "net_borrowing",
+            "净债务融资",
+            "亿元",
+            yi(net_borrowing),
+            "GCASHFLOW 借款收现+发债收现-偿债付现",
+            note="股东当年从债权人那里净拿到的资金；仅 FCFE 口径使用。",
+            evidence=net_borrowing_evidence,
+        ),
     ]
     if include_lease_debt:
         bridge_rows.append(
@@ -1693,7 +1857,7 @@ def build_ladder(
                 "亿元",
                 yi(lease_financing),
                 "GBALANCE 租赁负债(非流动) 较上年同日",
-                note="仅 FCFE 口径使用，与净借款流入相加；不含一年内到期部分",
+                note="仅 FCFE 口径使用，与净债务融资相加；不含一年内到期部分",
             )
         )
     bridge_rows.append(
@@ -1772,9 +1936,12 @@ def build_ladder(
         "终值与口径",
         [
             *terminal_growth_rows(tg_stats, sus_stats, terminal_growth, tg_basis, tg_measured),
-            Row("exit_pe", "一致预期市盈率", "倍数", {y: (v.get("pe") and round(v["pe"], 2)) for y, v in estimate.items()}, "yctj_chart PE(E)", kind="estimate"),
-            Row("pe_ttm", "当前滚动市盈率", "倍数", pe_ttm, "总市值 ÷ 归母净利润 LTM", evidence=pe_evidence, note="FCFE 退出倍数在预测末年之后沿用"),
-            Row("exit_ev_ebitda", "隐含 EV/EBITDA", "倍数", None if ev_ebitda is None else round(ev_ebitda, 2), "现价反推", kind="estimate", note="FCFF 退出倍数默认值"),
+            Row("exit_pe", "一致预期市盈率", "倍数", {y: (v.get("pe") and round(v["pe"], 2)) for y, v in estimate.items()}, "yctj_chart PE(E)", kind="estimate",
+                note="参考值，不进定价：退出倍数两臂都改按 EV/EBITDA 计价，这一行只留作卖方给的股权口径倍数对照。"),
+            Row("pe_ttm", "当前滚动市盈率", "倍数", pe_ttm, "总市值 ÷ 归母净利润 LTM", evidence=pe_evidence,
+                note="参考值，不进定价：退出倍数两臂都改按 EV/EBITDA 计价，这一行只留作市场今天给的股权口径倍数对照。"),
+            Row("exit_ev_ebitda", "隐含 EV/EBITDA", "倍数", None if ev_ebitda is None else round(ev_ebitda, 2), "现价反推", kind="estimate",
+                note="两臂退出倍数的定价行：FCFF 折出的终值本身就是企业价值，FCFE 那臂要在终止年扣掉净债务与少数股东权益才是股东那份。"),
             Row(
                 "horizon_target",
                 "显性预测期",
@@ -1832,6 +1999,8 @@ def build_ladder(
         groups=groups,
         warnings=[
             *erp_warnings(market_stats, erp_measured, erp_reason),
+            *([tax_fallback] if tax_fallback else []),
+            *([margin_shift_warning] if margin_shift_warning else []),
             *horizon_warnings(
                 horizon,
                 horizon_clamp,
