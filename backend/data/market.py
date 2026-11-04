@@ -30,7 +30,7 @@ import statistics
 from datetime import date, timedelta
 from typing import Any, Callable
 
-from backend.data import prices
+from backend.data import marketcache, prices
 from backend.data.macro import MAX_PLAUSIBLE_PCT
 from backend.data.transport import Fetched, RunStore, now_iso
 
@@ -102,11 +102,17 @@ def _total_return_leg(code: str, series: prices.IndexSeriesMap) -> dict:
     return {"source": f"akshare {prices.CSINDEX_FUNC}", "url": prices.CSINDEX_URL, "twin": twin, "closes": closes}
 
 
-def _dividend_leg() -> dict:
+def _dividend_leg(cache: marketcache.Cache | None = None) -> tuple[dict, str, bool]:
     """乐咕两市股息率：与基准无关（统计的是两市全部 A 股），一趟建链只取一次，无孪生的那几家共用。
 
     缺一侧也照落盘：ERP 会退回惯例值，但原始答复是什么必须留在凭证里。
+
+    交回 (载荷, 它真正联网的时刻, 是不是从本机缓存端来的)。这条腿与个股无关，所以也在市场级缓存的范围里。
     """
+    cached = cache.read(marketcache.MARKET_DIVIDEND) if cache is not None else None
+    if cached is not None:
+        return cached.payload, cached.fetched_at, True
+
     floor = (date.today() - timedelta(days=HISTORY_DAYS)).isoformat()
     markets: dict[str, Any] = {}
     for name in DIVIDEND_MARKETS:
@@ -114,10 +120,22 @@ def _dividend_leg() -> dict:
             markets[name] = _series(DIVIDEND_FUNC, "日期", "股息率", floor, symbol=name)
         except MarketUnavailable as exc:
             markets[name] = {"error": str(exc)}
-    return {"source": f"akshare {DIVIDEND_FUNC}", "url": DIVIDEND_URL, "markets": markets}
+    document = {"source": f"akshare {DIVIDEND_FUNC}", "url": DIVIDEND_URL, "markets": markets}
+    stamp = now_iso()
+    if cache is not None:
+        readable = [series for series in markets.values() if isinstance(series, dict) and series and not series.get("error")]
+        # 两侧都没读到数就不落缓存：一次故障不该顶着一整天不重试。
+        cache.save(
+            marketcache.MARKET_DIVIDEND, document, fetched_at=stamp,
+            last_day=marketcache.last_day_of([max(series) for series in readable]),
+            source=f"akshare {DIVIDEND_FUNC}", url=DIVIDEND_URL,
+        )
+    return document, stamp, False
 
 
-def fetch_all(series: prices.IndexSeriesMap, benchmark: str = prices.DEFAULT_BENCHMARK) -> Fetched:
+def fetch_all(
+    series: prices.IndexSeriesMap, benchmark: str = prices.DEFAULT_BENCHMARK, cache: marketcache.Cache | None = None
+) -> Fetched:
     """一份市场腿凭证装着所有预取到的基准：价格指数、各自的孪生、共用的股息率。
 
     股息率与基准无关（乐咕统计的是两市全部 A 股），所以一趟建链只取一次，三家无孪生的基准共用同一份。
@@ -131,23 +149,30 @@ def fetch_all(series: prices.IndexSeriesMap, benchmark: str = prices.DEFAULT_BEN
             "closes": series.closes(code, HISTORY_DAYS),
             "total_return": leg,
         }
+    dividend, dividend_at, dividend_cached = _dividend_leg(cache)
     channels = sorted({prices.index_channel(code) for code in book})
     funcs = [func for func, _ in channels] + [prices.CSINDEX_FUNC, DIVIDEND_FUNC]
     urls = [url for _, url in channels] + [prices.CSINDEX_URL, DIVIDEND_URL]
+    legs = (("指数收盘", series.fetched_at, series.from_cache), ("全市场股息率", dividend_at, dividend_cached))
+    reused = {name: at for name, at, hit in legs if hit}
     payload = {
         "source": "akshare " + "+".join(dict.fromkeys(funcs)),
         "url": " ; ".join(dict.fromkeys(urls)),
         "window_days": HISTORY_DAYS,
         "used_benchmark": prices.benchmark_code(benchmark),
         "benchmarks": book,
-        "dividend": _dividend_leg(),
+        "dividend": dividend,
         "unavailable": {code: why for code, why in series.unavailable.items() if code in prices.BENCHMARK_NAMES},
     }
+    if reused:
+        # 复用要留在凭证里：这份答复与联网那一版一模一样，差别只在它不是这一批下的线，以及它是几点下的。
+        payload["reused"] = reused
     text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return Fetched(
         name=RAW_NAME,
         url=payload["url"],
-        fetched_at=now_iso(),
+        # 两条腿各自真正联网的时刻里最早的那一个：这一批的证据有多旧，由最旧的那条腿说了算。
+        fetched_at=min(series.fetched_at, dividend_at),
         sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         payload=payload,
     )
@@ -197,6 +222,7 @@ def market_history(
     benchmark: str = prices.DEFAULT_BENCHMARK,
     live: bool = True,
     series: prices.IndexSeriesMap | None = None,
+    cache: marketcache.Cache | None = None,
 ) -> tuple[dict | None, str]:
     """(payload, provenance-or-reason) — a None payload means ERP stays the convention value.
 
@@ -217,8 +243,9 @@ def market_history(
         if not live:
             return None, f"unavailable: 批次 {store.snapshot_ref} 未记录 {RAW_NAME} 快照，--from-run 不重新联网"
 
+    book = series if series is not None else prices.IndexSeriesMap()
     try:
-        item = fetch_all((series or prices.IndexSeriesMap()).load(), benchmark)
+        item = fetch_all(book.load(), benchmark, cache)
     except (MarketUnavailable, prices.PricesUnavailable, ValueError) as exc:
         return None, f"unavailable: {exc}"
 
@@ -228,7 +255,9 @@ def market_history(
     if view is None:
         why = item.payload["unavailable"].get(code) or f"这次只预取到 {', '.join(prefetched(item.payload)) or '无'}"
         return None, f"unavailable: {code} 的市场腿没有原始序列——{why}"
-    return view, f"{item.payload['source']} @ {item.fetched_at}"
+    reused = (item.payload.get("reused") or {}).keys()
+    tail = f"，{'、'.join(reused)}复用本机市场缓存" if reused else ""
+    return view, f"{item.payload['source']} @ {item.fetched_at}{tail}"
 
 
 def _decimals(payload: dict | None, column: str) -> dict[str, float]:
