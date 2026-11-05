@@ -243,6 +243,26 @@ def test_startup_refreshes_the_index() -> None:
     check("拉不到索引不拦启动", "UniverseUnavailable" in server and "return 0" in server)
 
 
+def test_panel_launcher_runs_hidden() -> None:
+    """双击开面板的人不该看见服务器窗口，也不该在面板还没应答时拿到一个「无法访问」的页面。"""
+    server = (ROOT / "scripts" / "serve_panel.py").read_text(encoding="utf-8")
+    start = (ROOT / "start_panel.bat").read_text(encoding="utf-8")
+    stop = (ROOT / "stop_panel.bat").read_text(encoding="utf-8")
+    deploy = (ROOT / "deploy_panel.bat").read_text(encoding="utf-8")
+
+    check("开浏览器是显式开关", '"--open-browser"' in server)
+    check("等端口真的应答才开页面", "open_browser_when_ready" in server and "urllib.request.urlopen" in server)
+    check("重载器那一次不重复开标签页", "args.open_browser and not reloaded" in server)
+    check("端口已有人供着就把那一页开出来", re.search(r"已有服务在听.*?if args\.open_browser", server, re.S) is not None)
+    check("启动器把自己甩进隐藏窗口", "-WindowStyle Hidden" in start and "PANEL_HIDDEN" in start)
+    check("启动器请程序开页面", "--open-browser" in start)
+    check("没有控制台之后输出进日志", "valuation_panel.log" in start)
+    check("停止器按端口找在听的进程", "netstat" in stop and "LISTENING" in stop and "taskkill" in stop)
+    check("装依赖那一步的窗口仍然看得见", "-WindowStyle Hidden" not in deploy and "pause" in deploy)
+    for name, body in (("start_panel.bat", start), ("stop_panel.bat", stop), ("deploy_panel.bat", deploy)):
+        check(f"{name} 只用 ASCII（cmd 按控制台代码页读 .bat）", max(ord(char) for char in body) < 128)
+
+
 def test_shared_helpers_exist_once() -> None:
     """±%↔绝对值的换算只允许有一份，否则面板和推导图会各算一套口径。"""
     common = (STATIC_DIR / "common.js").read_text(encoding="utf-8")
