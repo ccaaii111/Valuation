@@ -3,10 +3,13 @@
     python scripts/serve_panel.py                # http://127.0.0.1:8765
     python scripts/serve_panel.py --port 9000 --debug
     python scripts/serve_panel.py --refresh-universe   # 先重建股票索引再开面板
+    python scripts/serve_panel.py --open-browser       # 端口应答后自动用默认浏览器打开
 
-From Windows Explorer, double-click start_panel.bat in the repository root — same thing, plus it
-keeps the console open so a startup error is readable. On a machine that has nothing installed yet,
-deploy_panel.bat creates .venv, installs requirements.txt, then runs this file.
+From Windows Explorer, double-click start_panel.bat in the repository root — same thing, run hidden
+in the background with the console output appended to %TEMP%\\valuation_panel.log, plus it opens the
+page for you. stop_panel.bat ends that background instance. On a machine that has nothing installed
+yet, deploy_panel.bat creates .venv, installs requirements.txt, then runs this file in a visible
+window so a startup error is readable.
 """
 from __future__ import annotations
 
@@ -14,6 +17,10 @@ import argparse
 import os
 import socket
 import sys
+import threading
+import time
+import urllib.request
+import webbrowser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,26 +65,50 @@ def port_in_use(host: str, port: int) -> bool:
         return False
 
 
+def open_browser_when_ready(url: str, timeout: float = 120.0) -> None:
+    """等面板真的应答再把页面开出来。
+
+    起服务前还要先看股票名录，联网重拉能花几十秒——按固定延时开浏览器会开在「无法访问」那一页上。
+    超时也照样开：那时失败原因已经写进控制台/日志，页面上至少看得见地址。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=0.5):
+                break
+        except OSError:
+            time.sleep(0.2)
+    webbrowser.open(url)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="本地假设修正面板")
     parser.add_argument("--host", default="127.0.0.1", help="默认只监听本机")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--debug", action="store_true", help="改代码自动重载")
     parser.add_argument("--refresh-universe", action="store_true", help="无视索引新鲜度，重拉一次全名录")
+    parser.add_argument("--open-browser", action="store_true", help="面板能应答后用默认浏览器打开它")
     args = parser.parse_args(argv)
+    url = f"http://{args.host}:{args.port}"
 
     # Werkzeug 的重载器会带着 WERKZEUG_RUN_MAIN 把本文件再跑一遍。子进程那一次端口正被父进程占着，
     # 股票索引也刚在父进程里查过——两件事都别再干，否则 --debug 一开就自己把自己挡在门外。
+    # 开浏览器同样只认父进程那一次，不然一按重载就多出两个标签页。
     reloaded = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     if not reloaded and port_in_use(args.host, args.port):
-        print(f"端口 {args.port} 已有服务在听：多半是面板已经开着（http://{args.host}:{args.port}）。")
+        print(f"端口 {args.port} 已有服务在听：多半是面板已经开着（{url}）。")
         print(f"要另开一个实例用 --port {args.port + 1}；确认旧实例已退出后再重跑本命令。")
+        if args.open_browser:
+            # 双击 bat 的人要的是那一页，不是第二个服务：页面已经有人供了就直接开给他看。
+            webbrowser.open(url)
         return 2
 
     if not reloaded:
         prepare_universe(force=args.refresh_universe)
     app: Flask = create_app()
-    print(f"面板: http://{args.host}:{args.port}  （Ctrl+C 退出）")
+    print(f"面板: {url}  （Ctrl+C 退出）")
+    if args.open_browser and not reloaded:
+        threading.Thread(target=open_browser_when_ready, args=(url,), daemon=True).start()
     app.run(host=args.host, port=args.port, debug=args.debug, use_reloader=args.debug, threaded=True)
     return 0
 
