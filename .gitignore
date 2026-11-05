@@ -8,6 +8,9 @@ data/universe.json
 # 与名录同理——都是一只票都不相关的市场公共数据，本地重新取数即可再生，批次证据仍落在 runs/ 里
 data/market_cache/
 
+# 离线验收用的三十个套件与 DOM 哨兵：只留在本机，不公开。程序不 import 它，缺它不影响取数、估值和面板
+tests/
+
 # Python
 __pycache__/
 *.py[cod]
