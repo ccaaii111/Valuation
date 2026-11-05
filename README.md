@@ -173,7 +173,7 @@ python scripts/run_valuation.py 000858 --overrides runs/000858/<批次>/manual.j
 
 ## 7. 怎么部署
 
-**仓库里有什么**：克隆下来是五个文件加四个目录，`data/` 和 `runs/` 要等程序第一次跑起来才出现，`.venv/` 是 `deploy_panel.bat` 建出来的本地虚拟环境。
+**仓库里有什么**：克隆下来是六个文件加三个目录，`data/` 和 `runs/` 要等程序第一次跑起来才出现，`.venv/` 是 `deploy_panel.bat` 建出来的本地虚拟环境，`tests/` 和它们一样不在版本库里（本节末「测试」）。
 
 ```
 backend/                程序本体，命令行和网页用的是同一套代码
@@ -184,7 +184,7 @@ backend/                程序本体，命令行和网页用的是同一套代�
 scripts/                六个入口：build_baseline 建链、run_valuation 出估值、serve_panel 开面板、
                         update_universe 重拉名录，另有两个针对偶发崩溃的复现脚本，平时用不到
 tests/                  30 个测试套件（全部离线）、fixtures.py 的假公司数据、run_all.py 一次跑完、
-                        dom_derivation_check.js 检查页面脚本
+                        dom_derivation_check.js 检查页面脚本；不在版本库里
 docs/caliber.md         每一个数凭什么、公式推导、常数表、已知限制
 data/universe.json      股票名录缓存，7 天内复用；不在版本库里
 data/market_cache/      国债序列、指数收盘、全市场股息率的本机缓存，同一根收盘轴内复用；不在版本库里
@@ -193,7 +193,7 @@ requirements.txt        五个依赖包及版本
 deploy_panel.bat        Windows 下双击：建 .venv、装依赖、开面板（窗口留着，装失败要看得见）
 start_panel.bat         Windows 下双击开面板，依赖得已经装好；面板进后台、页面自动打开、输出写 %TEMP%\valuation_panel.log
 stop_panel.bat          Windows 下双击停掉后台那一个：按端口找到在听的进程结束它
-.gitignore              排除 runs/、data/universe.json、data/market_cache/、.venv/、缓存和日志
+.gitignore              排除 runs/、data/universe.json、data/market_cache/、tests/、.venv/、缓存和日志
 ```
 
 模块级的职责分工（哪个文件负责哪一步）写在 `docs/caliber.md` §3。
@@ -231,6 +231,8 @@ python tests/run_all.py
 ```
 
 30 个套件，不用第三方框架，全部离线：数据用替身，批次写进临时目录，缓存写到系统临时目录再删，不碰网络也不碰 `runs/`。另有 `node tests/dom_derivation_check.js`（77 项检查）把页面脚本原样读进沙箱、打本机面板的真接口，钉的是页面渲染与交互那一层——它要面板在跑且 `runs/<代码>/` 里至少有一批，缺任一样就报「跳过」，不算失败。
+
+这两条命令跑的是本机的 `tests/`，它没有公开在这个仓库里，克隆下来没有这个目录。程序不 import 它，缺它不影响取数、估值和面板；上面写的行数和检查项数说的是写代码那台机器上那一份。
 
 ---
 
