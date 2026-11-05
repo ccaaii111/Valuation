@@ -71,8 +71,9 @@ tests/                    30 个 test_*.py 套件、fixtures.py 的假公司数�
                           dom_derivation_check.js 检查页面脚本（判据见 §10 末）
 docs/caliber.md           本文件
 requirements.txt          五个直接依赖包及版本
-deploy_panel.bat          Windows 下双击：建 .venv、按 requirements.txt 装包、开面板
-start_panel.bat           Windows 下双击开面板，依赖得已经装好
+deploy_panel.bat          Windows 下双击：建 .venv、按 requirements.txt 装包、开面板（窗口留着，装失败要看得见）
+start_panel.bat           Windows 下双击开面板，依赖得已经装好；面板进后台、页面能应答后自动打开、控制台输出写 %TEMP%\valuation_panel.log
+stop_panel.bat            Windows 下双击停掉后台那一个：按端口找到在听的进程结束它，端口收在参数上，默认 8765
 .gitignore                排除 runs/、data/universe.json、data/market_cache/、.venv/、缓存与日志
 ```
 
