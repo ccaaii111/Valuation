@@ -18,7 +18,7 @@
 python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 ```
 
-依赖已经装好的机器用 `start_panel.bat`，它跳过安装直接起面板。
+依赖已经装好的机器用 `start_panel.bat`，它跳过安装直接起面板：面板在后台跑，那个窗口只负责把它甩进后台就关掉，页面等端口能应答了自己用默认浏览器打开。控制台输出追加到 `%TEMP%\valuation_panel.log`；要停就双击 `stop_panel.bat`，它按端口找到在听的进程结束掉。不停的话它会一直服务到关机或你结束那个 python 进程。
 
 **手动三步**（命令行；macOS、Linux，或不想用 venv 的 Windows）：
 
@@ -27,7 +27,7 @@ python -m pip install -r requirements.txt
 python scripts/serve_panel.py            # 面板: http://127.0.0.1:8765
 ```
 
-起完之后打开这四个地址：
+起完之后打开这四个地址（`start_panel.bat` 只替你开首页，另外三个自己输；命令行想让它开首页加 `--open-browser`）：
 
 | 网址 | 是什么 |
 | --- | --- |
@@ -45,7 +45,7 @@ python scripts/build_baseline.py 600519   # 建一条假设链，联网
 python scripts/run_valuation.py 600519    # 出估值：六格矩阵 + 明细 + 自洽性校验
 ```
 
-**换端口**：默认 `127.0.0.1:8765`。两个 `.bat` 都把参数原样转给 `scripts/serve_panel.py`，所以换端口只是把这一串参数往后传：
+**换端口**：默认 `127.0.0.1:8765`。`start_panel.bat` 与 `deploy_panel.bat` 都把参数原样转给 `scripts/serve_panel.py`，所以换端口只是把这一串参数往后传；`stop_panel.bat` 收一个端口号，不给就用 8765：
 
 ```bash
 deploy_panel.bat --port 9000
@@ -53,7 +53,8 @@ python scripts/serve_panel.py --port 9000
 ```
 
 - `--host` 改监听地址，默认只绑本机。要绑到 `0.0.0.0` 请先自己加反向代理和认证——程序没有登录、没有鉴权、也没有并发写保护，详见 §7。
-- 端口已经被占用时不会起一个收不到请求的实例：`serve_panel.py` 先探端口，占着就打印「端口 9000 已有服务在听」并给出下一个可用端口，退出码 2。
+- 端口已经被占用时不会起一个收不到请求的实例：`serve_panel.py` 先探端口，占着就打印「端口 9000 已有服务在听」并给出下一个可用端口，退出码 2。双击 `start_panel.bat` 时带了 `--open-browser`，这一句进日志，浏览器直接开已经活着的那一页。
+- `--open-browser` 是等端口能应答再开页面，不是在固定秒数后开：启动前先看股票名录，联网重拉能花几十秒。`--debug` 下只开一次，重载器那一次不重复开标签页。
 - `--debug` 是改完代码自动重载，开发时用。
 - 页面脚本检查跟端口走：`PANEL_BASE=http://127.0.0.1:9000 node tests/dom_derivation_check.js`。
 
@@ -189,8 +190,9 @@ data/universe.json      股票名录缓存，7 天内复用；不在版本库里
 data/market_cache/      国债序列、指数收盘、全市场股息率的本机缓存，同一根收盘轴内复用；不在版本库里
 runs/                   每次取数留下的原始响应与算出来的基线，按代码和批次分目录；不在版本库里
 requirements.txt        五个依赖包及版本
-deploy_panel.bat        Windows 下双击：建 .venv、装依赖、开面板
-start_panel.bat         Windows 下双击开面板，依赖得已经装好
+deploy_panel.bat        Windows 下双击：建 .venv、装依赖、开面板（窗口留着，装失败要看得见）
+start_panel.bat         Windows 下双击开面板，依赖得已经装好；面板进后台、页面自动打开、输出写 %TEMP%\valuation_panel.log
+stop_panel.bat          Windows 下双击停掉后台那一个：按端口找到在听的进程结束它
 .gitignore              排除 runs/、data/universe.json、data/market_cache/、.venv/、缓存和日志
 ```
 
